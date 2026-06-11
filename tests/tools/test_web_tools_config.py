@@ -396,6 +396,77 @@ class TestBackendSelection:
              patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             assert _get_backend() == "parallel"
 
+    # ── Perplexity (search-only backend) ──────────────────────────────
+
+    def test_config_perplexity(self):
+        """web.backend=perplexity in config → 'perplexity'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "perplexity"}):
+            assert _get_backend() == "perplexity"
+
+    def test_config_perplexity_overrides_env_keys(self):
+        """web.backend=perplexity in config → 'perplexity' even if Firecrawl key set."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "perplexity"}), \
+             patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
+            assert _get_backend() == "perplexity"
+
+    def test_fallback_perplexity_ranked_last(self):
+        """Perplexity is search-only → never displaces an extract-capable backend in fallback."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch.dict(os.environ, {"PERPLEXITY_API_KEY": "pplx-test", "EXA_API_KEY": "exa-test"}):
+            assert _get_backend() == "exa"
+
+
+class TestPerplexitySearch:
+    """Test suite for the Perplexity search backend helpers."""
+
+    def test_normalize_search_api_shape(self):
+        from tools.web_tools import _normalize_perplexity_search_results
+        out = _normalize_perplexity_search_results(
+            {"results": [{"title": "A", "url": "https://a.com", "snippet": "hi"}]}, 5
+        )
+        assert out == {"success": True, "data": {"web": [
+            {"title": "A", "url": "https://a.com", "description": "hi", "position": 1}
+        ]}}
+
+    def test_normalize_chat_shape_prefers_search_results(self):
+        from tools.web_tools import _normalize_perplexity_search_results
+        out = _normalize_perplexity_search_results(
+            {"search_results": [{"title": "B", "url": "https://b.com"}],
+             "citations": ["https://c.com"]}, 5
+        )
+        assert [r["url"] for r in out["data"]["web"]] == ["https://b.com"]
+
+    def test_normalize_citations_only_strings(self):
+        from tools.web_tools import _normalize_perplexity_search_results
+        out = _normalize_perplexity_search_results(
+            {"citations": ["https://x.com", "https://y.com"]}, 5
+        )
+        assert [r["url"] for r in out["data"]["web"]] == ["https://x.com", "https://y.com"]
+
+    def test_search_falls_back_to_chat_on_404(self):
+        """A 404 from /search routes to /chat/completions and parses its citations."""
+        import tools.web_tools as w
+        r404 = MagicMock(status_code=404)
+        rchat = MagicMock(status_code=200)
+        rchat.json.return_value = {"search_results": [{"title": "Z", "url": "https://z.com"}]}
+        rchat.raise_for_status.return_value = None
+        with patch.dict(os.environ, {"PERPLEXITY_API_KEY": "pplx-test"}), \
+             patch.object(w.httpx, "post", side_effect=[r404, rchat]) as post:
+            out = w._perplexity_search("q", 3)
+        assert out["data"]["web"][0]["url"] == "https://z.com"
+        assert post.call_count == 2
+        assert post.call_args_list[1].args[0].endswith("/chat/completions")
+
+    def test_search_requires_api_key(self):
+        import tools.web_tools as w
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PERPLEXITY_API_KEY", None)
+            with pytest.raises(ValueError, match="PERPLEXITY_API_KEY"):
+                w._perplexity_search("q", 3)
+
 
 class TestParallelClientConfig:
     """Test suite for Parallel client initialization."""

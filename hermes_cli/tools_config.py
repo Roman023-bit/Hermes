@@ -291,6 +291,14 @@ TOOL_CATEGORIES = {
                 ],
             },
             {
+                "name": "Perplexity",
+                "tag": "Search only — web_extract/crawl fall back to another backend",
+                "web_backend": "perplexity",
+                "env_vars": [
+                    {"key": "PERPLEXITY_API_KEY", "prompt": "Perplexity API key", "url": "https://www.perplexity.ai/account/api"},
+                ],
+            },
+            {
                 "name": "Firecrawl Self-Hosted",
                 "badge": "free · self-hosted",
                 "tag": "Run your own Firecrawl instance (Docker)",

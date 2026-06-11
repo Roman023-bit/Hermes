@@ -17,6 +17,7 @@ Backend compatibility:
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
 - Tavily: https://tavily.com (search, extract, crawl)
+- Perplexity: https://docs.perplexity.ai (search only; web_extract/web_crawl fall back to another configured backend)
 
 LLM Processing:
 - Uses OpenRouter API with Gemini 3 Flash Preview for intelligent content extraction
@@ -126,17 +127,19 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "perplexity"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
-    # tool gateway is configured for Nous subscribers.
+    # tool gateway is configured for Nous subscribers. Perplexity is search-only
+    # and ranked last so it never silently displaces an extract-capable backend.
     backend_candidates = (
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("perplexity", _has_env("PERPLEXITY_API_KEY")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -155,6 +158,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "perplexity":
+        return _has_env("PERPLEXITY_API_KEY")
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -225,6 +230,7 @@ def _web_requires_env() -> list[str]:
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
+        "PERPLEXITY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
     ]
@@ -399,6 +405,123 @@ def _normalize_tavily_documents(response: dict, fallback_url: str = "") -> List[
             "metadata": {"sourceURL": url_str},
         })
     return documents
+
+
+# ─── Perplexity Client ───────────────────────────────────────────────────────
+# Perplexity is a *search-only* backend here: it exposes a Search API (and the
+# Sonar answer models, which return citations), but no content-extraction or
+# crawl API. web_search routes here; web_extract/web_crawl fall back to another
+# configured backend (see _extract_fallback_backend / web_crawl_tool).
+
+_PERPLEXITY_BASE_URL = os.getenv("PERPLEXITY_BASE_URL", "https://api.perplexity.ai")
+
+
+def _normalize_perplexity_search_results(response: Any, limit: int = 5) -> dict:
+    """Normalize a Perplexity response to the standard web search format.
+
+    Handles both response shapes Perplexity can return:
+
+    * Search API (``/search``):  ``{"results": [{title, url, snippet, ...}]}``
+    * Sonar chat (``/chat/completions``): ``{"search_results": [{title, url}],
+      "citations": ["https://...", ...], "choices": [...]}``
+
+    Maps either onto ``{success, data: {web: [{title, url, description,
+    position}]}}``.
+    """
+    items: List[Any] = []
+    if isinstance(response, dict):
+        raw = response.get("results")
+        if not isinstance(raw, list) or not raw:
+            raw = response.get("search_results")
+        if isinstance(raw, list) and raw:
+            items = raw
+        elif isinstance(response.get("citations"), list):
+            items = response["citations"]
+
+    web_results: List[Dict[str, Any]] = []
+    for i, r in enumerate(items[:limit]):
+        if isinstance(r, str):
+            web_results.append({"title": "", "url": r, "description": "", "position": i + 1})
+        elif isinstance(r, dict):
+            web_results.append({
+                "title": r.get("title", "") or "",
+                "url": r.get("url", "") or "",
+                "description": (
+                    r.get("snippet")
+                    or r.get("excerpt")
+                    or r.get("description")
+                    or r.get("text")
+                    or ""
+                ),
+                "position": i + 1,
+            })
+
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _perplexity_search(query: str, limit: int = 5) -> dict:
+    """Search the web via Perplexity and return results as a dict.
+
+    Prefers the dedicated Search API. When that endpoint is unavailable for the
+    account (404/403) or returns nothing, falls back to a Sonar chat completion
+    and harvests its ``search_results`` / ``citations``. Requires
+    ``PERPLEXITY_API_KEY``.
+    """
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "PERPLEXITY_API_KEY environment variable not set. "
+            "Get your API key at https://www.perplexity.ai/account/api"
+        )
+
+    base = _PERPLEXITY_BASE_URL.rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    n = min(max(int(limit), 1), 20)
+    logger.info("Perplexity search: '%s' (limit=%d)", query, n)
+
+    # 1) Dedicated Search API — returns ranked links directly.
+    try:
+        resp = httpx.post(
+            f"{base}/search",
+            headers=headers,
+            json={"query": query, "max_results": n},
+            timeout=60,
+        )
+        # 403/404 → account has no Search API access; fall through to chat.
+        if resp.status_code not in (403, 404):
+            resp.raise_for_status()
+            normalized = _normalize_perplexity_search_results(resp.json(), n)
+            if normalized["data"]["web"]:
+                return normalized
+    except httpx.HTTPError as exc:
+        logger.info("Perplexity /search unavailable (%s); falling back to Sonar chat.", str(exc)[:80])
+
+    # 2) Fallback: Sonar answer model, harvest the citations it searched.
+    model = (os.getenv("PERPLEXITY_SEARCH_MODEL", "sonar").strip() or "sonar")
+    resp = httpx.post(
+        f"{base}/chat/completions",
+        headers=headers,
+        json={"model": model, "messages": [{"role": "user", "content": query}]},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return _normalize_perplexity_search_results(resp.json(), n)
+
+
+def _extract_fallback_backend() -> Optional[str]:
+    """Pick an extraction-capable backend when the search backend can't extract.
+
+    Perplexity (search-only) routes web_extract here. Returns the first
+    available extract-capable backend, or ``None`` when none is configured.
+    """
+    for backend in ("firecrawl", "exa", "parallel", "tavily"):
+        if _is_backend_available(backend):
+            return backend
+    return None
 
 
 def _to_plain_object(value: Any) -> Any:
@@ -1147,6 +1270,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.save()
             return result_json
 
+        if backend == "perplexity":
+            response_data = _perplexity_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "tavily":
             logger.info("Tavily search: '%s' (limit: %d)", query, limit)
             raw = _tavily_request("search", {
@@ -1285,6 +1417,20 @@ async def web_extract_tool(
             results = []
         else:
             backend = _get_backend()
+
+            # Perplexity is search-only — it has no content-extraction API.
+            # Transparently fall back to an extract-capable backend so
+            # web_extract keeps working while Perplexity handles search.
+            if backend == "perplexity":
+                backend = _extract_fallback_backend()
+                if backend is None:
+                    return tool_error(
+                        "web_extract is unavailable: Perplexity is configured as the "
+                        "web search backend but has no content-extraction API. "
+                        "Configure an extraction backend too (set FIRECRAWL_API_KEY, "
+                        "EXA_API_KEY, PARALLEL_API_KEY, or TAVILY_API_KEY).",
+                        success=False,
+                    )
 
             if backend == "parallel":
                 results = await _parallel_extract(safe_urls)
@@ -1967,9 +2113,9 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "perplexity"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "perplexity"))
 
 
 def check_auxiliary_model() -> bool:
@@ -2004,6 +2150,8 @@ if __name__ == "__main__":
             print("   Using Parallel API (https://parallel.ai)")
         elif backend == "tavily":
             print("   Using Tavily API (https://tavily.com)")
+        elif backend == "perplexity":
+            print("   Using Perplexity Search API (https://perplexity.ai) — search only")
         else:
             if firecrawl_url_available:
                 print(f"   Using self-hosted Firecrawl: {os.getenv('FIRECRAWL_API_URL').strip().rstrip('/')}")
