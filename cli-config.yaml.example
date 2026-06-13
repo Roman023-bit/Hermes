@@ -843,6 +843,14 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
+  #
+  # NOTE: delegation.model is GLOBAL — every child in a session uses it. There
+  # is no per-call model on delegate_task(). So pick what delegation is for in a
+  # given session:
+  #   * REVIEW-MODE   model: "openai/gpt-5.3-codex"        # author != reviewer
+  #   * RESEARCH-MODE model: "google/gemini-3-pro-preview" # parallel researchers
+  # For one-off research it's usually simpler to switch the MAIN model with
+  # `/model <research-alias>` than to flip delegation.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
@@ -1037,3 +1045,27 @@ display:
 #     - command: "~/.hermes/agent-hooks/log-orchestration.sh"
 #
 # hooks_auto_accept: false
+
+# ─── Cost tracking ──────────────────────────────────────────────────────────
+# Tracks money-spending operations (paid tool APIs + LLM calls) so Hermes can
+# show a per-turn footer (which tools/models ran and what the turn cost) and a
+# persistent lifetime total in ~/.hermes/spend.json. View it with `/spend` in
+# the CLI/messaging, or `hermes spend` (add --json for the raw store).
+cost_tracking:
+  # Master switch. When false, nothing is recorded and no footer is shown.
+  enabled: true
+
+  # Show the end-of-turn spend footer in the interactive CLI (tools, models,
+  # turn/session/lifetime cost). The footer is CLI-only by design — the gateway
+  # is multi-user, so per-turn attribution there would mix users; use /spend in
+  # messaging instead. Lifetime/`hermes spend` stay accurate everywhere.
+  show_footer: true
+
+  # Optional overrides for the approximate paid-tool price table (USD). Only
+  # set what you want to change; unset entries keep the built-in estimates.
+  # prices:
+  #   search:   { perplexity: 0.006, exa: 0.005, firecrawl: 0.001, tavily: 0.008, parallel: 0.009 }
+  #   extract:  { firecrawl: 0.001, exa: 0.001, parallel: 0.001, tavily: 0.008 }
+  #   crawl:    { firecrawl: 0.001, tavily: 0.008 }
+  #   image:    { fal: 0.04, openai: 0.04 }
+  #   tts:      { elevenlabs: 0.00003 }   # USD per character
