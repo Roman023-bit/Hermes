@@ -1767,6 +1767,17 @@ def text_to_speech_tool(
         file_size = os.path.getsize(file_str)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
 
+        # Record TTS spend (per character) for the cost ledger. Free/local
+        # engines price to $0 (status 'included'); only paid voices add cost.
+        try:
+            from tools import cost_ledger, tool_pricing
+            _amt, _status, _units = tool_pricing.tts_cost(provider, len(text))
+            cost_ledger.record_tool(
+                "text_to_speech", backend=provider, amount_usd=_amt, status=_status, units=_units
+            )
+        except Exception:
+            pass
+
         # Build response with MEDIA tag for platform delivery
         media_tag = f"MEDIA:{file_str}"
         if voice_compatible:

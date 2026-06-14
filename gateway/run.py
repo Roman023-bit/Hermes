@@ -5278,6 +5278,13 @@ class GatewayRunner:
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical == "spend":
+            try:
+                from tools import cost_ledger
+                return cost_ledger.render_spend_report(markdown=True)
+            except Exception as exc:
+                return f"Could not load spend report: {exc}"
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 

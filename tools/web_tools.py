@@ -1252,6 +1252,18 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         # Dispatch to the configured backend
         backend = _get_backend()
+
+        # Record the (per-request) search cost for the spend ledger. Search is
+        # billed per call regardless of result count, so record once here.
+        try:
+            from tools import cost_ledger, tool_pricing
+            _amt, _status, _units = tool_pricing.search_cost(backend)
+            cost_ledger.record_tool(
+                "web_search", backend=backend, amount_usd=_amt, status=_status, units=_units
+            )
+        except Exception:
+            pass
+
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
@@ -1553,7 +1565,27 @@ async def web_extract_tool(
             results = ssrf_blocked + results
 
         response = {"results": results}
-        
+
+        # Record the (per-URL) extract cost. ``backend`` is only bound when we
+        # actually dispatched (safe_urls non-empty); include the auxiliary
+        # summarizer model when LLM post-processing will run.
+        try:
+            _ex_backend = locals().get("backend")
+            if _ex_backend and safe_urls:
+                from tools import cost_ledger, tool_pricing
+                _models = ()
+                if use_llm_processing and check_auxiliary_model():
+                    _aux = model or _get_default_summarizer_model()
+                    if _aux:
+                        _models = (_aux,)
+                _amt, _status, _units = tool_pricing.extract_cost(_ex_backend, len(safe_urls))
+                cost_ledger.record_tool(
+                    "web_extract", backend=_ex_backend, models=_models,
+                    amount_usd=_amt, status=_status, units=_units,
+                )
+        except Exception:
+            pass
+
         pages_extracted = len(response.get('results', []))
         logger.info("Extracted content from %d pages", pages_extracted)
         
@@ -1772,6 +1804,12 @@ async def web_crawl_tool(
             # (skip the Firecrawl-specific crawl logic)
             pages_crawled = len(response.get('results', []))
             logger.info("Crawled %d pages", pages_crawled)
+            try:
+                from tools import cost_ledger, tool_pricing
+                _amt, _status, _units = tool_pricing.crawl_cost(backend, pages_crawled)
+                cost_ledger.record_tool("web_crawl", backend=backend, amount_usd=_amt, status=_status, units=_units)
+            except Exception:
+                pass
             debug_call_data["pages_crawled"] = pages_crawled
             debug_call_data["original_response_size"] = len(json.dumps(response))
 
@@ -1977,7 +2015,13 @@ async def web_crawl_tool(
         
         pages_crawled = len(response.get('results', []))
         logger.info("Crawled %d pages", pages_crawled)
-        
+        try:
+            from tools import cost_ledger, tool_pricing
+            _amt, _status, _units = tool_pricing.crawl_cost(backend, pages_crawled)
+            cost_ledger.record_tool("web_crawl", backend=backend, amount_usd=_amt, status=_status, units=_units)
+        except Exception:
+            pass
+
         debug_call_data["pages_crawled"] = pages_crawled
         debug_call_data["original_response_size"] = len(json.dumps(response))
         

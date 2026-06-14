@@ -5012,6 +5012,18 @@ def cmd_status(args):
     show_status(args)
 
 
+def cmd_spend(args):
+    """Show total Hermes spend (lifetime, today, top sources)."""
+    from tools import cost_ledger
+
+    if getattr(args, "json", False):
+        import json as _json
+        store = cost_ledger.load_store()
+        print(_json.dumps(store, indent=2, default=str))
+        return
+    print(cost_ledger.render_spend_report())
+
+
 def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
@@ -7699,6 +7711,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "import",
         "completion",
         "logs",
+        "spend",
     }
     _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
 
@@ -8621,6 +8634,23 @@ def main():
         "--deep", action="store_true", help="Run deep checks (may take longer)"
     )
     status_parser.set_defaults(func=cmd_status)
+
+    # =========================================================================
+    # spend command
+    # =========================================================================
+    spend_parser = subparsers.add_parser(
+        "spend",
+        help="Show total Hermes spend (lifetime, today, top sources)",
+        description=(
+            "Report cumulative Hermes spend from ~/.hermes/spend.json: lifetime "
+            "total, today's total, and the top cost sources (models + paid "
+            "tools). Figures are approximate."
+        ),
+    )
+    spend_parser.add_argument(
+        "--json", action="store_true", help="Emit the raw spend store as JSON."
+    )
+    spend_parser.set_defaults(func=cmd_spend)
 
     # =========================================================================
     # cron command

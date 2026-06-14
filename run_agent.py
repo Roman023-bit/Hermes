@@ -11709,6 +11709,22 @@ class AIAgent:
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
 
+                        # Record this LLM call in the spend ledger so the
+                        # end-of-turn footer can attribute cost to the model.
+                        # Per-call amount (not the session cumulative).
+                        try:
+                            from tools import cost_ledger
+                            cost_ledger.record_llm(
+                                self.model,
+                                amount_usd=float(cost_result.amount_usd)
+                                if cost_result.amount_usd is not None else None,
+                                status=cost_result.status,
+                                role="main",
+                                provider=self.provider,
+                            )
+                        except Exception:
+                            pass
+
                         # Persist token counts to session DB for /insights.
                         # Do this for every platform with a session_id so non-CLI
                         # sessions (gateway, cron, delegated runs) cannot lose

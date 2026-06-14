@@ -6491,6 +6491,8 @@ class HermesCLI:
                 self._reload_skills()
         elif canonical == "browser":
             self._handle_browser_command(cmd_original)
+        elif canonical == "spend":
+            self._show_spend()
         elif canonical == "plugins":
             try:
                 from hermes_cli.plugins import get_plugin_manager
@@ -7596,6 +7598,44 @@ class HermesCLI:
 
         args = SimpleNamespace(lines=200, expire=7, local=False)
         run_debug_share(args)
+
+    def _show_spend(self):
+        """Show the persistent lifetime spend report (``/spend``)."""
+        try:
+            from tools import cost_ledger
+            print()
+            print(cost_ledger.render_spend_report())
+            print()
+        except Exception as exc:
+            print(f"(._.) Could not load spend report: {exc}")
+
+    def _render_spend_footer(self):
+        """Print the end-of-turn spend footer (tools, models, turn/session/
+        lifetime cost). No-op when disabled or there was no priced activity.
+        """
+        summary = getattr(self, "_last_turn_summary", None)
+        if summary is None:
+            return
+        # Config gate: cost_tracking.show_footer (default True).
+        show = True
+        try:
+            from hermes_cli.config import load_config
+            section = load_config().get("cost_tracking", {})
+            if isinstance(section, dict) and "show_footer" in section:
+                show = bool(section.get("show_footer"))
+        except Exception:
+            show = True
+        if not show:
+            return
+
+        from tools import cost_ledger
+        footer = cost_ledger.render_footer(summary)
+        if not footer:
+            return
+        try:
+            print(f"\n{_DIM}{footer}{_RST}")
+        except Exception:
+            print("\n" + footer)
 
     def _show_usage(self):
         """Show rate limits (if available) and session token usage."""
@@ -9252,6 +9292,11 @@ class HermesCLI:
                     agent_message = _srn + "\n\n" + agent_message
                     self._pending_skills_reload_note = None
                 try:
+                    try:
+                        from tools import cost_ledger as _cost_ledger
+                        _cost_ledger.begin_turn()
+                    except Exception:
+                        pass
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
@@ -9271,6 +9316,14 @@ class HermesCLI:
                         "error": _summary,
                     }
                 finally:
+                    # Finalize the spend ledger for this turn: rolls cost into
+                    # the session + lifetime stores and stashes the summary for
+                    # the footer rendered on the main thread after the response.
+                    try:
+                        from tools import cost_ledger as _cost_ledger
+                        self._last_turn_summary = _cost_ledger.end_turn()
+                    except Exception:
+                        self._last_turn_summary = None
                     # Clear thread-local callbacks so a reused thread doesn't
                     # hold stale references to a disposed CLI instance.
                     try:
@@ -9525,6 +9578,13 @@ class HermesCLI:
                         padding=(1, 4),
                     ))
 
+
+            # Spend footer: tools + models used this turn and turn/session/
+            # lifetime cost. Gated by cost_tracking.show_footer (default on).
+            try:
+                self._render_spend_footer()
+            except Exception:
+                pass
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.

@@ -982,12 +982,32 @@ def _handle_image_generate(args, **kw):
     # not the in-tree FAL path).
     dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
     if dispatched is not None:
-        return dispatched
+        result = dispatched
+    else:
+        result = image_generate_tool(prompt=prompt, aspect_ratio=aspect_ratio)
 
-    return image_generate_tool(
-        prompt=prompt,
-        aspect_ratio=aspect_ratio,
-    )
+    _record_image_cost(result, args)
+    return result
+
+
+def _record_image_cost(result_json, args) -> None:
+    """Record image-generation spend (best-effort) for the cost ledger."""
+    try:
+        payload = json.loads(result_json) if isinstance(result_json, str) else {}
+        if not payload.get("success"):
+            return
+        backend = (_read_configured_image_provider() or "fal")
+        try:
+            count = int(args.get("num_images") or 1)
+        except (TypeError, ValueError):
+            count = 1
+        from tools import cost_ledger, tool_pricing
+        amount, status, units = tool_pricing.image_cost(backend, count)
+        cost_ledger.record_tool(
+            "image_generate", backend=backend, amount_usd=amount, status=status, units=units
+        )
+    except Exception:
+        pass
 
 
 registry.register(
