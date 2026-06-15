@@ -1148,6 +1148,30 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
     return json.dumps(result)
 
 
+def _record_image_cost(result, backend, args) -> None:
+    """Record image-generation spend (best-effort, success only).
+
+    Never raises and never alters ``result`` — pure side-effect into the cost
+    ledger. ``result`` is the (already post-processed) tool output string.
+    """
+    try:
+        payload = json.loads(result) if isinstance(result, str) else (result if isinstance(result, dict) else {})
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return
+        try:
+            count = int((args or {}).get("num_images") or 1)
+        except (TypeError, ValueError):
+            count = 1
+        from tools import cost_ledger, tool_pricing
+        amount, status, units = tool_pricing.image_cost(backend, count)
+        cost_ledger.record_tool(
+            "image_generate", backend=backend,
+            amount_usd=amount, status=status, units=units,
+        )
+    except Exception:
+        logger.debug("cost_ledger image record failed", exc_info=True)
+
+
 def _handle_image_generate(args, **kw):
     prompt = args.get("prompt", "")
     if not prompt:
@@ -1159,13 +1183,17 @@ def _handle_image_generate(args, **kw):
     # not the in-tree FAL path).
     dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
     if dispatched is not None:
-        return _postprocess_image_generate_result(dispatched, task_id=task_id)
+        result = _postprocess_image_generate_result(dispatched, task_id=task_id)
+        _record_image_cost(result, _read_configured_image_provider() or "fal", args)
+        return result
 
     raw = image_generate_tool(
         prompt=prompt,
         aspect_ratio=aspect_ratio,
     )
-    return _postprocess_image_generate_result(raw, task_id=task_id)
+    result = _postprocess_image_generate_result(raw, task_id=task_id)
+    _record_image_cost(result, "fal", args)
+    return result
 
 
 registry.register(
