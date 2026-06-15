@@ -2463,6 +2463,36 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestBuildChildAgentProfile(unittest.TestCase):
+    def test_profile_prompt_reaches_system_prompt(self):
+        from unittest.mock import patch
+        import tools.delegate_tool as dt
+
+        captured = {}
+
+        def _fake_prompt(goal, context=None, **kw):
+            captured.update(kw)
+            return "stub-prompt"
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+        with patch.object(dt, "_build_child_system_prompt", side_effect=_fake_prompt), \
+             patch("run_agent.AIAgent"):
+            dt._build_child_agent(
+                task_index=0,
+                goal="do it",
+                context=None,
+                toolsets=None,
+                model="google/gemini-3-pro-preview",
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                profile_prompt="You are a researcher.",
+                profile_reasoning_effort="high",
+            )
+        self.assertEqual(captured.get("profile_prompt"), "You are a researcher.")
+
+
 class TestMergeProfileIntoCfg(unittest.TestCase):
     def test_profile_overrides_model_and_provider(self):
         from tools.delegate_tool import _merge_profile_into_cfg
