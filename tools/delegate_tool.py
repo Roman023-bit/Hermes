@@ -2490,6 +2490,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "profile": {
+                            "type": "string",
+                            "description": "Per-task specialist profile (see top-level 'profile').",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2513,6 +2517,18 @@ DELEGATE_TASK_SCHEMA = {
                     "(treated as 'leaf') when the child would exceed "
                     "max_spawn_depth or when "
                     "delegation.orchestrator_enabled=false."
+                ),
+            },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Specialist profile for the subagent — selects its model, "
+                    "toolset, reasoning effort, and role framing from the "
+                    "agent_profiles config. Orthogonal to 'role' (leaf vs "
+                    "orchestrator): a profile says WHO the worker is, role says "
+                    "whether it may delegate further. Unknown/omitted profiles "
+                    "fall back to the delegation defaults. Per-task 'profile' "
+                    "overrides this top-level value."
                 ),
             },
             "acp_command": {

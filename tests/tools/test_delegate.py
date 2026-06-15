@@ -75,6 +75,17 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("max_iterations", props)
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_schema_has_profile(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("profile", props)
+        self.assertEqual(props["profile"]["type"], "string")
+        # per-task profile override exists too
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("profile", task_props)
+        # role axis is untouched
+        self.assertIn("role", props)
+        self.assertEqual(props["role"]["enum"], ["leaf", "orchestrator"])
+
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
