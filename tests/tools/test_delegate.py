@@ -2533,5 +2533,73 @@ class TestMergeProfileIntoCfg(unittest.TestCase):
         self.assertEqual(merged["provider"], "openrouter")
 
 
+class TestDelegateProfileWiring(unittest.TestCase):
+    """Verify delegate_task resolves per-task profile -> model before build."""
+
+    class _StopBuild(Exception):
+        pass
+
+    def _run(self, tasks=None, goal=None, profile=None):
+        from unittest.mock import patch
+        import tools.delegate_tool as dt
+
+        captured = []
+
+        def _fake_build(**kw):
+            captured.append(kw)
+            raise self._StopBuild()
+
+        full_cfg = {
+            "delegation": {"model": "openai/gpt-5.3-codex", "provider": "openrouter",
+                           "max_iterations": 50},
+            "model_aliases": {
+                "research": {"model": "google/gemini-3-pro-preview", "provider": "openrouter"},
+            },
+            "agent_profiles": {
+                "researcher": {"model": "research", "toolsets": ["web"],
+                               "prompt": "You are a researcher."},
+            },
+        }
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file", "web"]
+        with patch.object(dt, "_load_config", return_value=full_cfg["delegation"]), \
+             patch("tools.agent_profiles.load_full_config", return_value=full_cfg), \
+             patch.object(dt, "_resolve_delegation_credentials",
+                          side_effect=lambda cfg, pa: {"model": cfg.get("model"),
+                                                        "provider": cfg.get("provider"),
+                                                        "base_url": None, "api_key": None,
+                                                        "api_mode": None}), \
+             patch.object(dt, "_build_child_agent", side_effect=_fake_build):
+            try:
+                dt.delegate_task(tasks=tasks, goal=goal, profile=profile, parent_agent=parent)
+            except self._StopBuild:
+                pass
+        return captured
+
+    def test_single_task_profile_sets_model_and_prompt(self):
+        cap = self._run(goal="research X", profile="researcher")
+        self.assertEqual(cap[0]["model"], "google/gemini-3-pro-preview")
+        self.assertEqual(cap[0]["profile_prompt"], "You are a researcher.")
+        self.assertEqual(cap[0]["toolsets"], ["web"])
+
+    def test_per_task_profile_beats_top_level(self):
+        cap = self._run(
+            tasks=[{"goal": "a", "profile": "researcher"}],
+            profile=None,
+        )
+        self.assertEqual(cap[0]["model"], "google/gemini-3-pro-preview")
+
+    def test_explicit_toolsets_beat_profile(self):
+        cap = self._run(
+            tasks=[{"goal": "a", "profile": "researcher", "toolsets": ["terminal"]}],
+        )
+        self.assertEqual(cap[0]["toolsets"], ["terminal"])
+
+    def test_no_profile_uses_delegation_default_model(self):
+        cap = self._run(goal="plain task")
+        self.assertEqual(cap[0]["model"], "openai/gpt-5.3-codex")
+        self.assertIsNone(cap[0].get("profile_prompt"))
+
+
 if __name__ == "__main__":
     unittest.main()
