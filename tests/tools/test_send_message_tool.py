@@ -241,6 +241,122 @@ class TestSendMessageTool:
         assert "access_token=***" in result["error"]
 
 
+class TestHomeChannelDirectoryFallback:
+    """A bare 'platform' target with no configured home channel should fall
+    back to the channel directory when the target is unambiguous."""
+
+    def _write_directory(self, tmp_path, channels):
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {"telegram": channels},
+        }))
+        return cache_file
+
+    def test_single_known_target_is_used_when_no_home_channel(self, tmp_path):
+        config, telegram_cfg = _make_config()  # get_home_channel -> None
+        cache_file = self._write_directory(
+            tmp_path,
+            [{"id": "350350350", "name": "Roman Mizanov", "type": "dm"}],
+        )
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {"action": "send", "target": "telegram", "message": "hello"}
+                )
+            )
+
+        assert result["success"] is True
+        assert "channel directory" in result["note"]
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "350350350",
+            "hello",
+            thread_id=None,
+            media_files=[],
+        )
+
+    def test_single_target_thread_id_is_carried_through(self, tmp_path):
+        config, telegram_cfg = _make_config()
+        cache_file = self._write_directory(
+            tmp_path,
+            [{"id": "-1001", "name": "Ops topic", "type": "group", "thread_id": "42"}],
+        )
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {"action": "send", "target": "telegram", "message": "hi"}
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hi",
+            thread_id="42",
+            media_files=[],
+        )
+
+    def test_multiple_known_targets_error_lists_candidates(self, tmp_path):
+        config, _telegram_cfg = _make_config()
+        cache_file = self._write_directory(
+            tmp_path,
+            [
+                {"id": "111", "name": "Alice", "type": "dm"},
+                {"id": "222", "name": "Bob", "type": "dm"},
+            ],
+        )
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as send_mock:
+            result = json.loads(
+                send_message_tool(
+                    {"action": "send", "target": "telegram", "message": "hello"}
+                )
+            )
+
+        assert "error" in result
+        assert "multiple known" in result["error"]
+        assert "telegram:111" in result["error"]
+        assert "telegram:222" in result["error"]
+        send_mock.assert_not_awaited()
+
+    def test_empty_directory_keeps_no_home_channel_error(self, tmp_path):
+        config, _telegram_cfg = _make_config()
+        cache_file = self._write_directory(tmp_path, [])
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as send_mock:
+            result = json.loads(
+                send_message_tool(
+                    {"action": "send", "target": "telegram", "message": "hello"}
+                )
+            )
+
+        assert "error" in result
+        assert "No home channel set for telegram" in result["error"]
+        send_mock.assert_not_awaited()
+
+
 class TestSendTelegramMediaDelivery:
     def test_sends_text_then_photo_for_media_tag(self, tmp_path, monkeypatch):
         image_path = tmp_path / "photo.png"

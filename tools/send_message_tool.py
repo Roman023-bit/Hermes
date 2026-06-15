@@ -245,6 +245,7 @@ def _handle_send(args):
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
+    used_directory = False
     if not chat_id:
         home = config.get_home_channel(platform)
         if not home and platform_name == "weixin":
@@ -256,11 +257,35 @@ def _handle_send(args):
             chat_id = home.chat_id
             used_home_channel = True
         else:
-            return json.dumps({
-                "error": f"No home channel set for {platform_name} to determine where to send the message. "
-                f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
-                f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
-            })
+            # No explicit home channel configured. The channel directory
+            # (same source as send_message(action='list') / `hermes send
+            # --list`) may still know exactly one target for this platform —
+            # e.g. a single DM. Use it when unambiguous so a bare
+            # 'platform' target just works; surface the candidates when
+            # several exist so the caller can pick one explicitly.
+            candidates = _directory_targets(platform_name)
+            if len(candidates) == 1:
+                chat_id = candidates[0]["id"]
+                thread_id = thread_id or candidates[0].get("thread_id")
+                used_directory = True
+            elif len(candidates) > 1:
+                listing = ", ".join(
+                    f"{platform_name}:{c['id']}"
+                    + (f" ({c['name']})" if c["name"] and c["name"] != c["id"] else "")
+                    for c in candidates
+                )
+                return json.dumps({
+                    "error": f"No home channel set for {platform_name} and multiple known "
+                    f"targets exist. Specify one explicitly, e.g. '{platform_name}:CHAT_ID', "
+                    f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>. "
+                    f"Known targets: {listing}"
+                })
+            else:
+                return json.dumps({
+                    "error": f"No home channel set for {platform_name} to determine where to send the message. "
+                    f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
+                    f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
+                })
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
@@ -278,8 +303,14 @@ def _handle_send(args):
                 media_files=media_files,
             )
         )
-        if used_home_channel and isinstance(result, dict) and result.get("success"):
-            result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
+        if isinstance(result, dict) and result.get("success"):
+            if used_home_channel:
+                result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
+            elif used_directory:
+                result["note"] = (
+                    f"Sent to {platform_name} (chat_id: {chat_id}) — resolved from the "
+                    f"channel directory (no home channel set)"
+                )
 
         # Mirror the sent message into the target's gateway session
         if isinstance(result, dict) and result.get("success") and mirror_text:
@@ -305,6 +336,36 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+def _directory_targets(platform_name: str):
+    """Return known channels for *platform_name* from the channel directory.
+
+    Reads the same on-disk directory that ``send_message(action='list')`` and
+    ``hermes send --list`` use, so the send path can fall back to it when no
+    home channel is configured. Each entry is normalised to
+    ``{"id", "name", "thread_id"}``; entries without a usable id are dropped.
+    Returns an empty list on any error or when nothing is known.
+    """
+    try:
+        from gateway.channel_directory import load_directory
+        raw = load_directory()
+    except Exception:
+        return []
+    channels = (raw.get("platforms") or {}).get(platform_name, []) or []
+    out = []
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+        cid = ch.get("id") or ch.get("chat_id")
+        if not cid:
+            continue
+        out.append({
+            "id": str(cid),
+            "name": ch.get("name") or str(cid),
+            "thread_id": ch.get("thread_id"),
+        })
+    return out
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):
