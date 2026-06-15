@@ -2015,6 +2015,19 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 # ===========================================================================
 # Main tool function
 # ===========================================================================
+def _record_tts_cost(provider, text) -> None:
+    """Record TTS spend (best-effort) for the cost ledger. Never raises."""
+    try:
+        from tools import cost_ledger, tool_pricing
+        amount, status, units = tool_pricing.tts_cost(provider, len(text or ""))
+        cost_ledger.record_tool(
+            "text_to_speech", backend=provider,
+            amount_usd=amount, status=status, units=units,
+        )
+    except Exception:
+        logger.debug("cost_ledger TTS record failed", exc_info=True)
+
+
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
@@ -2296,6 +2309,9 @@ def text_to_speech_tool(
 
         file_size = os.path.getsize(file_str)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
+
+        # Record TTS spend (best-effort) now that the audio saved successfully.
+        _record_tts_cost(provider, text)
 
         # Build response with MEDIA tag for platform delivery
         media_tag = f"MEDIA:{file_str}"
