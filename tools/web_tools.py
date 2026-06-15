@@ -149,7 +149,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "perplexity"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -167,6 +167,7 @@ def _get_backend() -> str:
         ("firecrawl", _is_tool_gateway_ready()),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
+        ("perplexity", _has_env("PERPLEXITY_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
     )
     for backend, available in backend_candidates:
@@ -228,6 +229,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":
         return _has_env("BRAVE_SEARCH_API_KEY")
+    if backend == "perplexity":
+        return _has_env("PERPLEXITY_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
     if backend == "xai":
