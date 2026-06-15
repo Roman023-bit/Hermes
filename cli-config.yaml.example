@@ -313,6 +313,15 @@ terminal:
 #   sudo_password: "your-password-here"
 
 # =============================================================================
+# Cost tracking
+# =============================================================================
+# Tracks spend on paid tools (web search/extract, image gen, TTS) and LLM
+# calls in a local ledger. View totals with the /spend command.
+#
+# cost_tracking:
+#   show_footer: true   # per-turn spend footer in the CLI (default: true)
+
+# =============================================================================
 # Security Scanning (tirith)
 # =============================================================================
 # Optional pre-exec command security scanning via tirith.

@@ -3184,6 +3184,17 @@ def save_config_value(key_path: str, value: any) -> bool:
 # HermesCLI Class
 # ============================================================================
 
+def _spend_footer_enabled(section) -> bool:
+    """Whether the per-turn CLI spend footer is enabled (default True).
+
+    Gated by ``cost_tracking.show_footer``. Only an explicit ``False`` turns
+    it off; missing/malformed config keeps the default-on behavior.
+    """
+    if not isinstance(section, dict):
+        return True
+    return bool(section.get("show_footer", True))
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -7501,6 +7512,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._show_usage()
         elif canonical == "credits":
             self._show_credits()
+        elif canonical == "spend":
+            self._show_spend()
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -8249,6 +8262,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 print(f"  ❌ Compression failed: {e}")
 
 
+
+    def _show_spend(self):
+        """Show the persistent lifetime spend report (``/spend``)."""
+        try:
+            from tools import cost_ledger
+            print()
+            print(cost_ledger.render_spend_report())
+            print()
+        except Exception as exc:
+            print(f"(._.) Could not load spend report: {exc}")
+
+    def _render_spend_footer(self):
+        """Print the per-turn spend footer, gated by cost_tracking.show_footer.
+
+        No-op when disabled, when there is no turn summary, or when the footer
+        renders empty. Best-effort — never raises into the turn loop.
+        """
+        summary = getattr(self, "_last_turn_summary", None)
+        if summary is None:
+            return
+        try:
+            from hermes_cli.config import load_config
+            section = load_config().get("cost_tracking", {})
+        except Exception:
+            section = {}
+        if not _spend_footer_enabled(section):
+            return
+        try:
+            from tools import cost_ledger
+            footer = cost_ledger.render_footer(summary)
+        except Exception:
+            return
+        if not footer:
+            return
+        try:
+            print(f"\n{_DIM}{footer}{_RST}")
+        except Exception:
+            print("\n" + footer)
 
     def _show_usage(self):
         """Rate limits + session token usage (when a live agent exists) + Nous credits.
@@ -10237,6 +10288,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
                 try:
+                    from tools import cost_ledger as _cost_ledger
+                    _cost_ledger.begin_turn()
+                except Exception:
+                    pass
+                try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
@@ -10261,6 +10317,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # at this boundary paints cleanly above the prompt instead of being
                     # buried behind the streaming output.
                     self._flush_credit_notices()
+                    # Finalize the spend ledger for this turn and render the
+                    # per-turn footer (gated by cost_tracking.show_footer).
+                    try:
+                        from tools import cost_ledger as _cost_ledger
+                        self._last_turn_summary = _cost_ledger.end_turn()
+                    except Exception:
+                        self._last_turn_summary = None
+                    try:
+                        self._render_spend_footer()
+                    except Exception:
+                        pass
                     # Clear thread-local callbacks so a reused thread doesn't
                     # hold stale references to a disposed CLI instance.
                     try:
