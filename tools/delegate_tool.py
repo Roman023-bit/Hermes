@@ -2234,6 +2234,23 @@ def _resolve_child_credential_pool(effective_provider: Optional[str], parent_age
     return None
 
 
+def _merge_profile_into_cfg(delegation_cfg: dict, profile: Optional[dict]) -> dict:
+    """Overlay a resolved profile's model/provider onto the delegation cfg.
+
+    Returns a new dict (never mutates ``delegation_cfg``). Only ``model`` and
+    ``provider`` are overlaid, and only when the profile sets them, so the
+    result feeds straight into ``_resolve_delegation_credentials`` reusing the
+    existing provider-resolution path. ``None``/empty profile -> a plain copy.
+    """
+    merged = dict(delegation_cfg or {})
+    if profile:
+        if profile.get("model"):
+            merged["model"] = profile["model"]
+        if profile.get("provider"):
+            merged["provider"] = profile["provider"]
+    return merged
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 

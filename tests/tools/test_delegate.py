@@ -2463,5 +2463,34 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestMergeProfileIntoCfg(unittest.TestCase):
+    def test_profile_overrides_model_and_provider(self):
+        from tools.delegate_tool import _merge_profile_into_cfg
+
+        base = {"model": "openai/gpt-5.3-codex", "provider": "openrouter", "max_iterations": 50}
+        profile = {"model": "google/gemini-3-pro-preview", "provider": "nous"}
+        merged = _merge_profile_into_cfg(base, profile)
+        self.assertEqual(merged["model"], "google/gemini-3-pro-preview")
+        self.assertEqual(merged["provider"], "nous")
+        self.assertEqual(merged["max_iterations"], 50)  # untouched
+        self.assertEqual(base["model"], "openai/gpt-5.3-codex")  # base not mutated
+
+    def test_none_profile_returns_copy_of_base(self):
+        from tools.delegate_tool import _merge_profile_into_cfg
+
+        base = {"model": "x", "provider": "y"}
+        merged = _merge_profile_into_cfg(base, None)
+        self.assertEqual(merged, base)
+        self.assertIsNot(merged, base)
+
+    def test_profile_without_provider_keeps_base_provider(self):
+        from tools.delegate_tool import _merge_profile_into_cfg
+
+        base = {"model": "x", "provider": "openrouter"}
+        merged = _merge_profile_into_cfg(base, {"model": "z", "provider": None})
+        self.assertEqual(merged["model"], "z")
+        self.assertEqual(merged["provider"], "openrouter")
+
+
 if __name__ == "__main__":
     unittest.main()
