@@ -93,6 +93,19 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_profile_prompt_injected(self):
+        prompt = _build_child_system_prompt(
+            "Fix the tests", profile_prompt="You are a critical code reviewer."
+        )
+        self.assertIn("ROLE:", prompt)
+        self.assertIn("You are a critical code reviewer.", prompt)
+        # Role framing precedes the task block.
+        self.assertLess(prompt.index("ROLE:"), prompt.index("YOUR TASK"))
+
+    def test_no_profile_prompt_no_role_block(self):
+        prompt = _build_child_system_prompt("Fix the tests")
+        self.assertNotIn("ROLE:", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
