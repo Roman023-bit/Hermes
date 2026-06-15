@@ -3118,6 +3118,20 @@ class GatewaySlashCommandsMixin:
             lines.append("Complete your top-up in the browser — credits will appear in /credits shortly.")
         return "\n".join(lines)
 
+    async def _handle_spend_command(self, event: MessageEvent) -> str:
+        """Handle /spend -- show the persistent Hermes spend report.
+
+        Reads the local cost ledger (lifetime / today / top sources). Best-effort:
+        on any failure, logs at debug and returns a friendly message rather than
+        propagating into the gateway dispatch.
+        """
+        try:
+            from tools import cost_ledger
+            return cost_ledger.render_spend_report(markdown=True)
+        except Exception:
+            logger.debug("gateway /spend render failed", exc_info=True)
+            return "Could not load the spend report right now."
+
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
 
