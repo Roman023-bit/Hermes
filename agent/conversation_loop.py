@@ -1805,6 +1805,16 @@ def run_conversation(
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
 
+                    # Record this LLM call in the spend ledger (best-effort) so
+                    # the end-of-turn footer / /spend can attribute model cost.
+                    try:
+                        from tools import cost_ledger
+                        cost_ledger.record_llm_for_turn(
+                            agent.model, agent.provider, cost_result, role="main"
+                        )
+                    except Exception:
+                        logger.debug("cost_ledger LLM record failed", exc_info=True)
+
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
                     # sessions (gateway, cron, delegated runs) cannot lose

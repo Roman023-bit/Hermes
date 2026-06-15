@@ -210,6 +210,27 @@ def record_llm(
     )
 
 
+def record_llm_for_turn(model, provider, cost_result, *, role="main") -> None:
+    """Record an LLM call from a usage_pricing ``CostResult`` (best-effort glue).
+
+    Duck-types ``cost_result`` (``.amount_usd`` may be Decimal/float/None,
+    ``.status`` a string) and forwards to :func:`record_llm`. Never raises —
+    failures log at debug. Kept here so it is unit-testable without a live
+    conversation turn.
+    """
+    try:
+        amount = getattr(cost_result, "amount_usd", None)
+        record_llm(
+            model,
+            amount_usd=float(amount) if amount is not None else None,
+            status=getattr(cost_result, "status", STATUS_ESTIMATED),
+            role=role,
+            provider=provider,
+        )
+    except Exception:
+        logger.debug("record_llm_for_turn failed", exc_info=True)
+
+
 # ── Turn lifecycle ──────────────────────────────────────────────────────────
 
 def begin_turn() -> None:
