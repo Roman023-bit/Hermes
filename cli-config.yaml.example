@@ -1000,6 +1000,55 @@ display:
 #     base_url: "https://ollama.com/v1"
 
 # =============================================================================
+# Agent profiles
+# =============================================================================
+# Specialist profiles for delegate_task(profile=...). Each maps a name to a
+# model (an alias from model_aliases above, or a literal provider/model),
+# plus optional provider, toolsets, reasoning effort, and a system-prompt
+# fragment. A profile says WHO the worker is; it is orthogonal to the
+# leaf/orchestrator `role` (which says whether it may delegate further).
+# Unknown/omitted profiles fall back to the delegation defaults.
+#
+# agent_profiles:
+#   researcher:
+#     model: research            # alias from model_aliases, or provider/model
+#     toolsets: [web]
+#     reasoning_effort: medium
+#     prompt: "You are a rigorous researcher. Gather evidence, cite sources, separate fact from inference, flag uncertainty."
+#   reviewer:
+#     model: reviewer
+#     toolsets: [terminal, file]
+#     reasoning_effort: high
+#     prompt: "You are a critical code reviewer. Hunt for correctness bugs, edge cases, and security issues. Be specific with file:line."
+#   strategist:
+#     model: strateg
+#     reasoning_effort: high
+#     prompt: "You are a strategist. Think in trade-offs and second-order effects. Give a recommendation, not a survey."
+#   coder:
+#     model: reviewer
+#     toolsets: [terminal, file]
+#     reasoning_effort: medium
+#     prompt: "You are a focused implementer. Match surrounding code style. Make minimal, correct changes."
+#   writer:
+#     model: copywriter
+#     toolsets: [web]
+#     prompt: "You are a sharp copywriter. Clear, concrete, no filler."
+#   fast:
+#     model: flash
+#     reasoning_effort: low
+#     prompt: "You are a quick worker for simple, well-defined tasks. Be concise."
+#   analyst:
+#     model: strateg
+#     toolsets: [terminal, file]
+#     reasoning_effort: high
+#     prompt: "You are a data analyst. Query precisely, verify numbers, show your method, and state caveats and sample sizes."
+#   tester:
+#     model: reviewer
+#     toolsets: [terminal, file]
+#     reasoning_effort: high
+#     prompt: "You are a test engineer. Write focused failing tests first, cover edge cases, and run them to confirm behavior before claiming a pass."
+
+# =============================================================================
 # Privacy
 # =============================================================================
 # privacy:
