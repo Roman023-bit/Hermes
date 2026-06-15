@@ -629,6 +629,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    profile_prompt: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -638,11 +639,11 @@ def _build_child_system_prompt(
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """
-    parts = [
-        "You are a focused subagent working on a specific delegated task.",
-        "",
-        f"YOUR TASK:\n{goal}",
-    ]
+    parts = ["You are a focused subagent working on a specific delegated task."]
+    if profile_prompt and profile_prompt.strip():
+        parts.append(f"\nROLE:\n{profile_prompt.strip()}")
+    parts.append("")
+    parts.append(f"YOUR TASK:\n{goal}")
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -949,6 +950,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    profile_prompt: Optional[str] = None,
+    profile_reasoning_effort: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1036,6 +1039,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        profile_prompt=profile_prompt,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1124,7 +1128,9 @@ def _build_child_agent(
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
-        delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
+        delegation_effort = str(
+            profile_reasoning_effort or delegation_cfg.get("reasoning_effort") or ""
+        ).strip()
         if delegation_effort:
             from hermes_constants import parse_reasoning_effort
 
@@ -2018,6 +2024,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2068,6 +2075,22 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+
+    # Profile resolution: a named profile selects model/provider/toolset/
+    # reasoning/prompt for each child. Orthogonal to the leaf/orchestrator role.
+    top_profile = profile
+    from tools.agent_profiles import resolve_profile, load_full_config
+
+    _full_cfg = load_full_config()
+    _profile_creds_cache: Dict[Any, Any] = {}
+
+    def _creds_for_profile(prof: Optional[dict]):
+        key = (prof.get("model") if prof else None, prof.get("provider") if prof else None)
+        if key not in _profile_creds_cache:
+            merged = _merge_profile_into_cfg(cfg, prof)
+            _profile_creds_cache[key] = _resolve_delegation_credentials(merged, parent_agent)
+        return _profile_creds_cache[key]
+
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -2112,7 +2135,8 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {"goal": goal, "context": context, "toolsets": toolsets,
+             "role": top_role, "profile": top_profile}
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2153,28 +2177,34 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            profile_name = t.get("profile") or top_profile
+            prof = resolve_profile(profile_name, _full_cfg)
+            task_creds = _creds_for_profile(prof) if prof else creds
+            task_toolsets = t.get("toolsets") or (prof.get("toolsets") if prof else None) or toolsets
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                toolsets=task_toolsets,
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
                 override_acp_command=t.get("acp_command")
                 or acp_command
-                or creds.get("command"),
+                or task_creds.get("command"),
                 override_acp_args=(
                     task_acp_args
                     if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
+                    else (acp_args if acp_args is not None else task_creds.get("args"))
                 ),
                 role=effective_role,
+                profile_prompt=(prof.get("prompt") if prof else None),
+                profile_reasoning_effort=(prof.get("reasoning_effort") if prof else None),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2495,6 +2525,23 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+def _merge_profile_into_cfg(delegation_cfg: dict, profile: Optional[dict]) -> dict:
+    """Overlay a resolved profile's model/provider onto the delegation cfg.
+
+    Returns a new dict (never mutates ``delegation_cfg``). Only ``model`` and
+    ``provider`` are overlaid, and only when the profile sets them, so the
+    result feeds straight into ``_resolve_delegation_credentials`` reusing the
+    existing provider-resolution path. ``None``/empty profile -> a plain copy.
+    """
+    merged = dict(delegation_cfg or {})
+    if profile:
+        if profile.get("model"):
+            merged["model"] = profile["model"]
+        if profile.get("provider"):
+            merged["provider"] = profile["provider"]
+    return merged
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -2891,6 +2938,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "profile": {
+                            "type": "string",
+                            "description": "Per-task specialist profile (see top-level 'profile').",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2903,6 +2954,18 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Specialist profile for the subagent — selects its model, "
+                    "toolset, reasoning effort, and role framing from the "
+                    "agent_profiles config. Orthogonal to 'role' (leaf vs "
+                    "orchestrator): a profile says WHO the worker is, role says "
+                    "whether it may delegate further. Unknown/omitted profiles "
+                    "fall back to the delegation defaults. Per-task 'profile' "
+                    "overrides this top-level value."
+                ),
             },
             "acp_command": {
                 "type": "string",
