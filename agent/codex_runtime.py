@@ -135,6 +135,16 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_cost_status = cost_result.status
     agent.session_cost_source = cost_result.source
 
+    # Record this LLM call in the spend ledger (best-effort) — mirrors the
+    # main loop so the Codex app-server path also attributes model cost.
+    try:
+        from tools import cost_ledger
+        cost_ledger.record_llm_for_turn(
+            agent.model, agent.provider, cost_result, role="main"
+        )
+    except Exception:
+        logger.debug("cost_ledger LLM record failed", exc_info=True)
+
     if agent._session_db and agent.session_id:
         try:
             if not agent._session_db_created:
