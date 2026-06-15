@@ -876,6 +876,18 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             )
             response_data = provider.search(query, limit)
 
+            # Record paid web-search spend (best-effort) for the cost ledger.
+            try:
+                if response_data.get("success"):
+                    from tools import cost_ledger, tool_pricing
+                    _amt, _st, _u = tool_pricing.search_cost(provider.name)
+                    cost_ledger.record_tool(
+                        "web_search", backend=provider.name,
+                        amount_usd=_amt, status=_st, units=_u,
+                    )
+            except Exception:
+                logger.debug("cost_ledger web_search record failed", exc_info=True)
+
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)
@@ -1053,7 +1065,19 @@ async def web_extract_tool(
         
         pages_extracted = len(response.get('results', []))
         logger.info("Extracted content from %d pages", pages_extracted)
-        
+
+        # Record paid web-extract spend (best-effort) for the cost ledger.
+        try:
+            if safe_urls:
+                from tools import cost_ledger, tool_pricing
+                _amt, _st, _u = tool_pricing.extract_cost(provider.name, len(safe_urls))
+                cost_ledger.record_tool(
+                    "web_extract", backend=provider.name,
+                    amount_usd=_amt, status=_st, units=_u,
+                )
+        except Exception:
+            logger.debug("cost_ledger web_extract record failed", exc_info=True)
+
         debug_call_data["pages_extracted"] = pages_extracted
         debug_call_data["original_response_size"] = len(json.dumps(response))
         effective_model = model or _get_default_summarizer_model()
