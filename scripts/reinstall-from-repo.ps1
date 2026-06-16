@@ -267,14 +267,74 @@ function Invoke-Smoke {
     return $allOk
 }
 
+# --- Phase: rollback + execute orchestration (Task 6) ---
+function Restore-FromBackup {
+    param([string]$BackupPath)
+    Assert-SafePaths
+    Assert-PathInsideHermesHome -Path $BackupPath
+    if (-not (Test-Path (Join-Path $BackupPath "Scripts\python.exe"))) {
+        if ($Execute) { throw "invalid backup (no Scripts\python.exe): $BackupPath" }
+        Write-Log "rollback target not validated (dry-run): expects '$BackupPath\Scripts\python.exe'" "WARN"
+    }
+    Write-Log "rollback plan: restore live venv '$LiveVenv' from backup '$BackupPath'" "INFO"
+    Invoke-Action "disable watchdog, stop gateway, remove '$LiveVenv', rename '$BackupPath' -> '$LiveVenv', enable watchdog" {
+        Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+        & $HermesExe gateway stop 2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+        Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='hermes.exe'" |
+            Where-Object { $_.CommandLine -match 'gateway run' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $LiveVenv) { Remove-Item $LiveVenv -Recurse -Force }
+        Rename-Item $BackupPath $LiveVenv
+        Enable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+    }
+    Start-Gateway
+    Write-Log "rollback complete" "WARN"
+}
+
+function Invoke-RollbackMode {
+    if ([string]::IsNullOrWhiteSpace($Rollback)) { throw "-Rollback requires a backup path" }
+    if ($Execute -and -not (Test-Path $Rollback)) { throw "rollback path not found: $Rollback" }
+    if (-not (Test-Path $Rollback)) { Write-Log "rollback path does not exist (dry-run preview only): $Rollback" "WARN" }
+    Restore-FromBackup -BackupPath $Rollback
+}
+
+function Invoke-Execute {
+    Write-Log "EXECUTE: full reinstall sequence" "STEP"
+    # Non-live phases first (fail-fast: abort before touching the live runtime).
+    Test-Egress
+    Get-Wheelhouse
+    New-BuildVenv
+    Build-Wheel
+    # Live phases (auto-rollback on any failure after backup).
+    $bak = Backup-LiveVenv
+    Set-Watchdog -Action Disable
+    Stop-Gateway
+    try {
+        Install-Wheel
+        if (-not (Invoke-Smoke)) { throw "smoke checks failed" }
+    } catch {
+        Write-Log "live phase failed: $($_.Exception.Message) -- auto-rolling back" "ERROR"
+        Restore-FromBackup -BackupPath $bak
+        throw "Reinstall FAILED and was rolled back. Backup kept at $bak. Log: $LogFile"
+    }
+    Set-Watchdog -Action Enable
+    Start-Gateway
+    Invoke-Action "final gateway status" {
+        $st = & $HermesExe gateway status 2>&1
+        Write-Log "gateway status: $(("$st" -replace '\s+', ' ').Trim())" "INFO"
+    }
+    Write-Log "SUCCESS: reinstall complete; backup retained at $bak (delete when satisfied)" "STEP"
+}
+
 # --- Main dispatch ---
 $mode = Resolve-Mode
 Write-Log "reinstall-from-repo starting | mode=$mode | repo=$RepoRoot | live=$LiveVenv | log=$LogFile" "STEP"
 switch ($mode) {
-    "rollback" { Write-Log "rollback mode (stub - implemented in Task 6)" "WARN" }
-    "execute"  { Write-Log "execute mode (stub - implemented in Task 6)" "WARN" }
+    "rollback" { Invoke-RollbackMode }
+    "execute"  { Invoke-Execute }
     "dryrun"   {
         Write-Log "DRY-RUN: no side effects (egress is read-only; nothing downloaded/built)." "INFO"
+        Write-Log "phase order: egress -> wheelhouse -> build venv -> build wheel -> backup -> disable watchdog -> stop -> install -> smoke -> enable watchdog -> start -> status" "INFO"
         Test-Egress
         Get-Wheelhouse
         New-BuildVenv
