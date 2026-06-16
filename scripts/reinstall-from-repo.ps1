@@ -223,6 +223,50 @@ function Start-Gateway {
     }
 }
 
+# --- Phase: offline install + smoke (Task 5) ---
+function Install-Wheel {
+    Assert-SafePaths
+    Invoke-Action "offline install into live venv: `"$LivePy`" -m pip install --force-reinstall --no-deps --no-index --find-links `"$DistDir`" hermes-agent" {
+        if (-not $script:BuiltWheel -or -not (Test-Path $script:BuiltWheel)) { throw "no built wheel to install (Build-Wheel must run first)" }
+        & $LivePy -m pip install --force-reinstall --no-deps --no-index --find-links $DistDir hermes-agent
+        if ($LASTEXITCODE -ne 0) { throw "live offline install failed" }
+        Write-Log "installed wheel into live venv" "INFO"
+    }
+}
+
+function Invoke-Smoke {
+    # Read-only, no network. Version-tolerant: passes on both the current runtime
+    # and a freshly reinstalled (repo-main) runtime. Returns $true if all gates pass.
+    Write-Log "running smoke checks (read-only, no network) against '$LivePy'" "STEP"
+    if (-not (Test-Path $LivePy)) { Write-Log "smoke: live python not found: $LivePy" "ERROR"; return $false }
+    $cfg = Join-Path $HermesHome "config.yaml"
+    $checks = [ordered]@{
+        imports         = "import tools.agent_profiles, tools.cost_ledger, tools.tool_pricing, gateway.run, gateway.slash_commands, cli; print('OK')"
+        profile_schema  = "import tools.delegate_tool as d; assert 'profile' in d.DELEGATE_TASK_SCHEMA['parameters']['properties']; print('OK')"
+        profile_resolve = "import yaml, tools.agent_profiles as a; p=a.resolve_profile('researcher', yaml.safe_load(open(r'$cfg',encoding='utf-8'))); assert p and p.get('model'); print('OK', p['model'])"
+        spend_report    = "from tools import cost_ledger as c; r=c.render_spend_report(); assert isinstance(r,str) and r.strip(); print('OK')"
+        spend_handler   = "import inspect, gateway.run as g; from gateway.slash_commands import GatewaySlashCommandsMixin as M; assert hasattr(M,'_handle_spend_command') or ('_handle_spend_command' in inspect.getsource(g)); print('OK')"
+        perplexity      = "import tools.web_tools as w, importlib.util as u; assert hasattr(w,'_perplexity_search') or (u.find_spec('plugins.web.perplexity.provider') is not None); print('OK')"
+    }
+    $allOk = $true
+    foreach ($name in $checks.Keys) {
+        $out = & $LivePy -c $checks[$name] 2>&1
+        $ok = ($LASTEXITCODE -eq 0) -and ("$out" -match 'OK')
+        $detail = ("$out" -replace '\s+', ' ').Trim()
+        Write-Log ("  smoke[{0}] = {1} :: {2}" -f $name, $(if ($ok) { 'PASS' } else { 'FAIL' }), $detail) $(if ($ok) { 'INFO' } else { 'ERROR' })
+        if (-not $ok) { $allOk = $false }
+    }
+    # Replicate/image/video plugins live in HERMES_HOME (untouched by install).
+    # Per spec: verify the ones present now; absence is informational (not a gate).
+    foreach ($rp in @("plugins\image_gen\replicate", "plugins\replicate-video")) {
+        $full = Join-Path $HermesHome $rp
+        if (Test-Path $full) { Write-Log "  smoke[replicate:$rp] = PASS (present)" "INFO" }
+        else { Write-Log "  smoke[replicate:$rp] = absent (not installed; skipped)" "WARN" }
+    }
+    Write-Log ("smoke result: {0}" -f $(if ($allOk) { 'ALL PASS' } else { 'FAILURES' })) $(if ($allOk) { 'INFO' } else { 'ERROR' })
+    return $allOk
+}
+
 # --- Main dispatch ---
 $mode = Resolve-Mode
 Write-Log "reinstall-from-repo starting | mode=$mode | repo=$RepoRoot | live=$LiveVenv | log=$LogFile" "STEP"
@@ -239,8 +283,9 @@ switch ($mode) {
         $null = Backup-LiveVenv
         Set-Watchdog -Action Disable
         Stop-Gateway
-        Write-Log "  would: offline-install built wheel into live venv (Task 5)" "DRY"
-        Write-Log "  would: run smoke checks; auto-rollback from snapshot on failure (Task 5/6)" "DRY"
+        Install-Wheel
+        $smokeOk = Invoke-Smoke
+        Write-Log ("smoke (dry-run rehearsal, read-only) => {0}; under -Execute a FAIL auto-rolls back" -f $(if ($smokeOk) { 'PASS' } else { 'FAIL' })) $(if ($smokeOk) { 'INFO' } else { 'WARN' })
         Set-Watchdog -Action Enable
         Start-Gateway
     }
