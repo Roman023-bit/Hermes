@@ -57,7 +57,66 @@ function Resolve-Mode {
     return "dryrun"
 }
 
-# --- Phase functions are added in later tasks ---
+# --- Phase: egress + wheelhouse (Task 2) ---
+function Test-Egress {
+    Write-Log "checking SOCKS egress via $Proxy" "STEP"
+    foreach ($u in $EgressUrls) {
+        $code = & curl.exe -sS --proxy $Proxy --connect-timeout 12 --max-time 25 -o NUL -w "%{http_code}" -I $u 2>$null
+        Write-Log "  $u -> HTTP $code"
+        if ($code -ne "200") {
+            throw "Egress check failed for $u (HTTP '$code'). Populate $Wheelhouse from another machine, then re-run with -SkipWheelhouse."
+        }
+    }
+    Write-Log "egress OK" "INFO"
+}
+
+function Get-WheelUrl {
+    # Read the PyPI simple index through the proxy; return the newest
+    # py3-none-any wheel whose version satisfies $VersionFilter.
+    param([string]$Package, [scriptblock]$VersionFilter)
+    $html = & curl.exe -sS --proxy $Proxy --max-time 30 "https://pypi.org/simple/$Package/" 2>$null
+    $pattern = 'href="(?<url>[^"]+?/(?<file>' + [regex]::Escape($Package) + '-(?<ver>[0-9][^-]*)-py3-none-any\.whl)(#[^"]*)?)"'
+    $mm = [regex]::Matches([string]$html, $pattern)
+    $cands = foreach ($m in $mm) {
+        $verStr = $m.Groups['ver'].Value
+        try { $v = [version]($verStr -replace '[^0-9.].*$', '') } catch { continue }
+        if (& $VersionFilter $v) {
+            [pscustomobject]@{ ver = $v; file = $m.Groups['file'].Value; url = ($m.Groups['url'].Value -replace '#.*$', '') }
+        }
+    }
+    $best = $cands | Sort-Object ver -Descending | Select-Object -First 1
+    if (-not $best) { throw "No matching py3-none-any wheel for '$Package' on the PyPI simple index." }
+    return $best
+}
+
+function Get-Wheelhouse {
+    if ($SkipWheelhouse -and (Test-Path $Wheelhouse) -and (Get-ChildItem $Wheelhouse -Filter *.whl -ErrorAction SilentlyContinue)) {
+        Write-Log "wheelhouse: reusing cached $Wheelhouse (-SkipWheelhouse)" "INFO"
+        return
+    }
+    $needed = @(
+        @{ pkg = "setuptools"; filter = { param($v) ($v -ge [version]"77.0") -and ($v -lt [version]"83.0") } },
+        @{ pkg = "wheel";      filter = { param($v) $true } }
+    )
+    Invoke-Action "create $Wheelhouse and download build wheels via curl ($Proxy)" {
+        New-Item -ItemType Directory -Force -Path $Wheelhouse | Out-Null
+        foreach ($n in $needed) {
+            $w = Get-WheelUrl -Package $n.pkg -VersionFilter $n.filter
+            $dest = Join-Path $Wheelhouse $w.file
+            if (Test-Path $dest) { Write-Log "  cached: $($w.file)"; continue }
+            Write-Log "  fetching $($w.file)"
+            & curl.exe -sS --proxy $Proxy --max-time 120 -o $dest $w.url
+            if (-not (Test-Path $dest)) { throw "curl failed to download $($w.url)" }
+        }
+        Write-Log "wheelhouse ready: $((Get-ChildItem $Wheelhouse -Filter *.whl).Name -join ', ')" "INFO"
+    }
+    if (-not $Execute) {
+        foreach ($n in $needed) {
+            $w = Get-WheelUrl -Package $n.pkg -VersionFilter $n.filter
+            Write-Log "would fetch: $($w.file)  <-  $($w.url)" "DRY"
+        }
+    }
+}
 
 # --- Main dispatch ---
 $mode = Resolve-Mode
@@ -65,6 +124,10 @@ Write-Log "reinstall-from-repo starting | mode=$mode | repo=$RepoRoot | live=$Li
 switch ($mode) {
     "rollback" { Write-Log "rollback mode (stub - implemented in Task 6)" "WARN" }
     "execute"  { Write-Log "execute mode (stub - implemented in Task 6)" "WARN" }
-    "dryrun"   { Write-Log "DRY-RUN: no side effects. (full preview wired in later tasks)" "INFO" }
+    "dryrun"   {
+        Write-Log "DRY-RUN: no side effects (egress is read-only; nothing downloaded)." "INFO"
+        Test-Egress
+        Get-Wheelhouse
+    }
 }
 Write-Log "done (mode=$mode)" "STEP"
