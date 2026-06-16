@@ -25,7 +25,7 @@
 
 .PARAMETER SkipWheelhouse
   Reuse an existing build/wheelhouse instead of re-resolving/downloading the
-  build wheels (setuptools, wheel).
+  build wheels (setuptools, wheel, packaging).
 
 .PARAMETER Proxy
   SOCKS proxy for curl when fetching the wheelhouse.
@@ -142,7 +142,8 @@ function Get-Wheelhouse {
     }
     $needed = @(
         @{ pkg = "setuptools"; filter = { param($v) ($v -ge [version]"77.0") -and ($v -lt [version]"83.0") } },
-        @{ pkg = "wheel";      filter = { param($v) $true } }
+        @{ pkg = "wheel";      filter = { param($v) $true } },
+        @{ pkg = "packaging";  filter = { param($v) $v -ge [version]"24.0" } }
     )
     Invoke-Action "create $Wheelhouse and download build wheels via curl ($Proxy)" {
         New-Item -ItemType Directory -Force -Path $Wheelhouse | Out-Null
@@ -178,9 +179,9 @@ function New-BuildVenv {
         & $SysPy -m venv $BuildVenv
         if (-not (Test-Path $bpy)) { throw "build venv creation failed: $bpy missing" }
     }
-    Invoke-Action "`"$bpy`" -m pip install --no-index --find-links `"$Wheelhouse`" `"setuptools>=77,<83`" wheel" {
-        & $bpy -m pip install --no-index --find-links $Wheelhouse "setuptools>=77,<83" wheel
-        if ($LASTEXITCODE -ne 0) { throw "build venv: offline install of setuptools/wheel from wheelhouse failed" }
+    Invoke-Action "`"$bpy`" -m pip install --no-index --find-links `"$Wheelhouse`" `"setuptools>=77,<83`" wheel `"packaging>=24`"" {
+        & $bpy -m pip install --no-index --find-links $Wheelhouse "setuptools>=77,<83" wheel "packaging>=24"
+        if ($LASTEXITCODE -ne 0) { throw "build venv: offline install of setuptools/wheel/packaging from wheelhouse failed" }
         $ver = & $bpy -c "import setuptools; print(setuptools.__version__)"
         Write-Log "build venv setuptools=$ver" "INFO"
     }
@@ -236,12 +237,32 @@ function Backup-LiveVenv {
 }
 
 function Set-Watchdog {
-    param([ValidateSet("Disable","Enable")] [string]$Action)
-    Invoke-Action "$Action scheduled task '$TaskName'" {
-        if ($Action -eq "Disable") { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
+    param([ValidateSet("Disable","Enable")] [string]$WatchdogAction)
+    $requestedAction = $WatchdogAction
+    Invoke-Action "$requestedAction scheduled task '$TaskName'" {
+        if ($requestedAction -eq "Disable") { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
         else { Enable-ScheduledTask -TaskName $TaskName | Out-Null }
-        Write-Log "watchdog $($Action.ToLower())d" "INFO"
+        Write-Log "watchdog $($requestedAction.ToLower())d" "INFO"
     }
+}
+
+function Stop-LiveVenvProcesses {
+    param([string]$Reason = "live venv maintenance")
+    $livePattern = [regex]::Escape($LiveVenv)
+    $currentPid = $PID
+    $procs = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='hermes.exe' OR Name='powershell.exe' OR Name='wscript.exe'" |
+        Where-Object {
+            $_.ProcessId -ne $currentPid -and (
+                ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($LiveVenv, [StringComparison]::OrdinalIgnoreCase)) -or
+                ($_.CommandLine -and $_.CommandLine -match $livePattern) -or
+                ($_.CommandLine -and $_.CommandLine -match 'gateway run')
+            )
+        }
+    foreach ($p in $procs) {
+        Write-Log "stopping process for ${Reason}: pid=$($p.ProcessId) name=$($p.Name)" "INFO"
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($procs) { Start-Sleep -Seconds 2 }
 }
 
 function Stop-Gateway {
@@ -249,6 +270,7 @@ function Stop-Gateway {
     Invoke-Action "stop gateway ('$HermesExe' gateway stop) and ensure no 'gateway run' processes remain" {
         & $HermesExe gateway stop 2>&1 | Out-Null
         Start-Sleep -Seconds 3
+        Stop-LiveVenvProcesses -Reason "reinstall"
         $rem = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='hermes.exe'" | Where-Object { $_.CommandLine -match 'gateway run' }
         if ($rem) { $rem | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep 2 }
         Write-Log "gateway stopped" "INFO"
@@ -327,8 +349,7 @@ function Restore-FromBackup {
         Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
         & $HermesExe gateway stop 2>&1 | Out-Null
         Start-Sleep -Seconds 3
-        Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='hermes.exe'" |
-            Where-Object { $_.CommandLine -match 'gateway run' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Stop-LiveVenvProcesses -Reason "rollback"
         if (Test-Path $LiveVenv) { Remove-Item $LiveVenv -Recurse -Force }
         Rename-Item $BackupPath $LiveVenv
         Enable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
@@ -353,7 +374,7 @@ function Invoke-Execute {
     Build-Wheel
     # Live phases (auto-rollback on any failure after backup).
     $bak = Backup-LiveVenv
-    Set-Watchdog -Action Disable
+    Set-Watchdog -WatchdogAction Disable
     Stop-Gateway
     try {
         Install-Wheel
@@ -363,7 +384,7 @@ function Invoke-Execute {
         Restore-FromBackup -BackupPath $bak
         throw "Reinstall FAILED and was rolled back. Backup kept at $bak. Log: $LogFile"
     }
-    Set-Watchdog -Action Enable
+    Set-Watchdog -WatchdogAction Enable
     Start-Gateway
     Invoke-Action "final gateway status" {
         $st = & $HermesExe gateway status 2>&1
@@ -387,12 +408,12 @@ switch ($mode) {
         Build-Wheel
         Write-Log "DRY-RUN preview of live phases:" "INFO"
         $null = Backup-LiveVenv
-        Set-Watchdog -Action Disable
+        Set-Watchdog -WatchdogAction Disable
         Stop-Gateway
         Install-Wheel
         $smokeOk = Invoke-Smoke
         Write-Log ("smoke (dry-run rehearsal, read-only) => {0}; under -Execute a FAIL auto-rolls back" -f $(if ($smokeOk) { 'PASS' } else { 'FAIL' })) $(if ($smokeOk) { 'INFO' } else { 'WARN' })
-        Set-Watchdog -Action Enable
+        Set-Watchdog -WatchdogAction Enable
         Start-Gateway
         Write-Log "----- DRY-RUN SUMMARY -----" "STEP"
         Write-Log "  mode          : $mode (Execute=$Execute, SkipWheelhouse=$SkipWheelhouse)" "INFO"
