@@ -118,6 +118,42 @@ function Get-Wheelhouse {
     }
 }
 
+# --- Phase: build venv + build wheel (Task 3) ---
+function New-BuildVenv {
+    $bpy = Join-Path $BuildVenv "Scripts\python.exe"
+    if (-not (Test-Path $SysPy)) {
+        if ($Execute) { throw "System Python not found at $SysPy (needed to create the build venv)." }
+        Write-Log "system python NOT found at $SysPy (would be required for -Execute)" "WARN"
+    } else {
+        Write-Log "build venv target: $BuildVenv (from system python $SysPy)" "INFO"
+    }
+    Invoke-Action "recreate build venv: `"$SysPy`" -m venv `"$BuildVenv`"" {
+        if (Test-Path $BuildVenv) { Remove-Item $BuildVenv -Recurse -Force }
+        & $SysPy -m venv $BuildVenv
+        if (-not (Test-Path $bpy)) { throw "build venv creation failed: $bpy missing" }
+    }
+    Invoke-Action "`"$bpy`" -m pip install --no-index --find-links `"$Wheelhouse`" `"setuptools>=77,<83`" wheel" {
+        & $bpy -m pip install --no-index --find-links $Wheelhouse "setuptools>=77,<83" wheel
+        if ($LASTEXITCODE -ne 0) { throw "build venv: offline install of setuptools/wheel from wheelhouse failed" }
+        $ver = & $bpy -c "import setuptools; print(setuptools.__version__)"
+        Write-Log "build venv setuptools=$ver" "INFO"
+    }
+}
+
+function Build-Wheel {
+    $bpy = Join-Path $BuildVenv "Scripts\python.exe"
+    Invoke-Action "clean $DistDir, then build: `"$bpy`" -m pip wheel `"$RepoRoot`" --no-build-isolation --no-deps -w `"$DistDir`"" {
+        if (Test-Path $DistDir) { Remove-Item (Join-Path $DistDir "*.whl") -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+        & $bpy -m pip wheel $RepoRoot --no-build-isolation --no-deps -w $DistDir
+        if ($LASTEXITCODE -ne 0) { throw "pip wheel build failed" }
+        $whl = Get-ChildItem $DistDir -Filter "hermes_agent-*.whl" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $whl) { throw "no hermes_agent wheel produced in $DistDir" }
+        Write-Log "built wheel: $($whl.Name)" "INFO"
+        $script:BuiltWheel = $whl.FullName
+    }
+}
+
 # --- Main dispatch ---
 $mode = Resolve-Mode
 Write-Log "reinstall-from-repo starting | mode=$mode | repo=$RepoRoot | live=$LiveVenv | log=$LogFile" "STEP"
@@ -125,9 +161,11 @@ switch ($mode) {
     "rollback" { Write-Log "rollback mode (stub - implemented in Task 6)" "WARN" }
     "execute"  { Write-Log "execute mode (stub - implemented in Task 6)" "WARN" }
     "dryrun"   {
-        Write-Log "DRY-RUN: no side effects (egress is read-only; nothing downloaded)." "INFO"
+        Write-Log "DRY-RUN: no side effects (egress is read-only; nothing downloaded/built)." "INFO"
         Test-Egress
         Get-Wheelhouse
+        New-BuildVenv
+        Build-Wheel
     }
 }
 Write-Log "done (mode=$mode)" "STEP"
