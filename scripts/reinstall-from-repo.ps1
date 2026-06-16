@@ -154,6 +154,75 @@ function Build-Wheel {
     }
 }
 
+# --- Path guards (run always, incl. dry-run; throw before any destructive op) ---
+function Assert-SafePaths {
+    if ([string]::IsNullOrWhiteSpace($HermesHome)) { throw "guard: HERMES_HOME is empty" }
+    if (-not (Test-Path $HermesHome)) { throw "guard: HERMES_HOME not found: $HermesHome" }
+    if ((Split-Path $LiveVenv -Leaf) -ne "pypi-venv") { throw "guard: LiveVenv must end with 'pypi-venv', got: $LiveVenv" }
+    $hh = [System.IO.Path]::GetFullPath($HermesHome)
+    $lv = [System.IO.Path]::GetFullPath($LiveVenv)
+    if (-not $lv.StartsWith($hh, [System.StringComparison]::OrdinalIgnoreCase)) { throw "guard: LiveVenv not inside HERMES_HOME ($LiveVenv)" }
+}
+
+function Assert-PathInsideHermesHome {
+    param([string]$Path)
+    $hh = [System.IO.Path]::GetFullPath($HermesHome)
+    $p  = [System.IO.Path]::GetFullPath($Path)
+    if (-not $p.StartsWith($hh, [System.StringComparison]::OrdinalIgnoreCase)) { throw "guard: path not inside HERMES_HOME: $Path" }
+}
+
+# --- Phase: live-runtime helpers (Task 4) ---
+function Backup-LiveVenv {
+    Assert-SafePaths
+    $bak = "$LiveVenv.bak-$Stamp"
+    Assert-PathInsideHermesHome -Path $bak
+    Write-Log "backup plan: '$LiveVenv' -> '$bak' (+ config.yaml/.env copies)" "INFO"
+    Invoke-Action "snapshot live venv to '$bak' and back up config.yaml/.env" {
+        if (Test-Path $bak) { throw "backup already exists: $bak" }
+        Copy-Item $LiveVenv $bak -Recurse
+        if (-not (Test-Path (Join-Path $bak "Scripts\python.exe"))) { throw "venv backup incomplete: $bak" }
+        Copy-Item (Join-Path $HermesHome "config.yaml") (Join-Path $HermesHome "config.yaml.bak-reinstall-$Stamp") -Force
+        Copy-Item (Join-Path $HermesHome ".env")        (Join-Path $HermesHome ".env.bak-reinstall-$Stamp") -Force
+        Write-Log "backup ready: $bak" "INFO"
+    }
+    $script:BackupPath = $bak
+    return $bak
+}
+
+function Set-Watchdog {
+    param([ValidateSet("Disable","Enable")] [string]$Action)
+    Invoke-Action "$Action scheduled task '$TaskName'" {
+        if ($Action -eq "Disable") { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
+        else { Enable-ScheduledTask -TaskName $TaskName | Out-Null }
+        Write-Log "watchdog $($Action.ToLower())d" "INFO"
+    }
+}
+
+function Stop-Gateway {
+    Assert-SafePaths
+    Invoke-Action "stop gateway ('$HermesExe' gateway stop) and ensure no 'gateway run' processes remain" {
+        & $HermesExe gateway stop 2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+        $rem = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='hermes.exe'" | Where-Object { $_.CommandLine -match 'gateway run' }
+        if ($rem) { $rem | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep 2 }
+        Write-Log "gateway stopped" "INFO"
+    }
+}
+
+function Start-Gateway {
+    Assert-SafePaths
+    Invoke-Action "start gateway: '$HermesExe' gateway run --replace --accept-hooks -v (detached) and confirm running" {
+        $out = Join-Path $LogDir "gateway-run.out.log"
+        $err = Join-Path $LogDir "gateway-run.err.log"
+        Start-Process -FilePath $HermesExe -ArgumentList 'gateway','run','--replace','--accept-hooks','-v' `
+            -WorkingDirectory $HermesHome -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden | Out-Null
+        Start-Sleep -Seconds 22
+        $procs = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='hermes.exe'" | Where-Object { $_.CommandLine -match 'gateway run' }
+        if (-not $procs) { throw "gateway did not come up after start" }
+        Write-Log "gateway running (pids: $(($procs.ProcessId) -join ','))" "INFO"
+    }
+}
+
 # --- Main dispatch ---
 $mode = Resolve-Mode
 Write-Log "reinstall-from-repo starting | mode=$mode | repo=$RepoRoot | live=$LiveVenv | log=$LogFile" "STEP"
@@ -166,6 +235,14 @@ switch ($mode) {
         Get-Wheelhouse
         New-BuildVenv
         Build-Wheel
+        Write-Log "DRY-RUN preview of live phases:" "INFO"
+        $null = Backup-LiveVenv
+        Set-Watchdog -Action Disable
+        Stop-Gateway
+        Write-Log "  would: offline-install built wheel into live venv (Task 5)" "DRY"
+        Write-Log "  would: run smoke checks; auto-rollback from snapshot on failure (Task 5/6)" "DRY"
+        Set-Watchdog -Action Enable
+        Start-Gateway
     }
 }
 Write-Log "done (mode=$mode)" "STEP"
