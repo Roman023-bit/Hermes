@@ -2,9 +2,55 @@
 <#
 .SYNOPSIS
   Reproducible reinstall of Hermes into the live pypi-venv from local repo main.
+
 .DESCRIPTION
-  Default = dry-run (checks + plan, no side effects). -Execute performs the real
-  build+install with backup/rollback. -Rollback <path> restores a venv snapshot.
+  Builds a Hermes wheel from the local repo in an isolated build venv (offline,
+  using build tooling fetched into build/wheelhouse via SOCKS curl), then installs
+  it into the live pypi-venv fully offline. Wraps the live phases with backup,
+  watchdog pause/restore, smoke verification, and automatic rollback.
+
+  Default invocation is a DRY-RUN: it runs read-only checks (egress, wheel-URL
+  resolution, smoke) and prints the exact plan WITHOUT downloading, building,
+  stopping the gateway, or modifying the live runtime. Pass -Execute to perform
+  the real reinstall. Pass -Rollback <path> to restore a venv snapshot (preview
+  only unless combined with -Execute).
+
+.PARAMETER Execute
+  Perform the real build + install (and, in -Rollback mode, the real restore).
+  Without it, every side-effecting step is only previewed ("would: ...").
+
+.PARAMETER Rollback
+  Path to a pypi-venv.bak-<timestamp> snapshot to restore. Selects rollback mode;
+  preview-only unless -Execute is also passed. Must be inside HERMES_HOME.
+
+.PARAMETER SkipWheelhouse
+  Reuse an existing build/wheelhouse instead of re-resolving/downloading the
+  build wheels (setuptools, wheel).
+
+.PARAMETER Proxy
+  SOCKS proxy for curl when fetching the wheelhouse.
+  Default: socks5h://127.0.0.1:10808.
+
+.EXAMPLE
+  scripts\reinstall-from-repo.ps1
+  Dry-run: read-only checks + full plan, no side effects.
+
+.EXAMPLE
+  scripts\reinstall-from-repo.ps1 -Execute
+  Real reinstall: build -> backup -> stop -> install -> smoke -> restart
+  (auto-rollback on smoke failure).
+
+.EXAMPLE
+  scripts\reinstall-from-repo.ps1 -Execute -SkipWheelhouse
+  Real reinstall reusing the cached build/wheelhouse.
+
+.EXAMPLE
+  scripts\reinstall-from-repo.ps1 -Rollback "$env:LOCALAPPDATA\hermes\pypi-venv.bak-20260616_063721"
+  Preview a rollback. Add -Execute to actually restore the snapshot.
+
+.NOTES
+  Windows PowerShell 5.1. Requires curl.exe (SOCKS5) and system Python 3.11.
+  The live runtime is touched only under -Execute, and only after a successful build.
 #>
 [CmdletBinding()]
 param(
@@ -348,6 +394,18 @@ switch ($mode) {
         Write-Log ("smoke (dry-run rehearsal, read-only) => {0}; under -Execute a FAIL auto-rolls back" -f $(if ($smokeOk) { 'PASS' } else { 'FAIL' })) $(if ($smokeOk) { 'INFO' } else { 'WARN' })
         Set-Watchdog -Action Enable
         Start-Gateway
+        Write-Log "----- DRY-RUN SUMMARY -----" "STEP"
+        Write-Log "  mode          : $mode (Execute=$Execute, SkipWheelhouse=$SkipWheelhouse)" "INFO"
+        Write-Log "  repo          : $RepoRoot" "INFO"
+        Write-Log "  HERMES_HOME   : $HermesHome" "INFO"
+        Write-Log "  live venv     : $LiveVenv" "INFO"
+        Write-Log "  wheelhouse    : $Wheelhouse" "INFO"
+        Write-Log "  build venv    : $BuildVenv" "INFO"
+        Write-Log "  dist          : $DistDir" "INFO"
+        Write-Log "  watchdog task : $TaskName" "INFO"
+        Write-Log "  proxy         : $Proxy" "INFO"
+        Write-Log "  log           : $LogFile" "INFO"
+        Write-Log "  to apply for real: scripts\reinstall-from-repo.ps1 -Execute" "INFO"
     }
 }
 Write-Log "done (mode=$mode)" "STEP"
