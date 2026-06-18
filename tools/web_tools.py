@@ -880,7 +880,9 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             try:
                 if response_data.get("success"):
                     from tools import cost_ledger, tool_pricing
-                    _amt, _st, _u = tool_pricing.search_cost(provider.name)
+                    _amt, _st, _u = tool_pricing.search_cost(
+                        provider.name, usage=response_data.get("usage")
+                    )
                     cost_ledger.record_tool(
                         "web_search", backend=provider.name,
                         amount_usd=_amt, status=_st, units=_u,

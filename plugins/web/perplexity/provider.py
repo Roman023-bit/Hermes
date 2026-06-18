@@ -67,7 +67,13 @@ def _normalize_perplexity_search_results(response: Any, limit: int = 5) -> Dict[
                 "position": i + 1,
             })
 
-    return {"success": True, "data": {"web": web_results}}
+    result: Dict[str, Any] = {"success": True, "data": {"web": web_results}}
+    # Propagate token usage when present (Sonar /chat/completions reports it;
+    # the dedicated /search endpoint does not) so tool_pricing can price the
+    # call by tokens instead of the flat per-request fallback.
+    if isinstance(response, dict) and isinstance(response.get("usage"), dict):
+        result["usage"] = response["usage"]
+    return result
 
 
 class PerplexityWebSearchProvider(WebSearchProvider):
