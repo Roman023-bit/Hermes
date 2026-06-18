@@ -14,6 +14,7 @@ __pycache__/
 .env.development
 .env.test
 .hermes-docker/
+.swarm/
 .notebooklm-home/
 .notebooklm-cli-venv/
 .notebooklm-playwright/
