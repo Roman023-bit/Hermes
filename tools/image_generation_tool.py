@@ -1163,7 +1163,9 @@ def _record_image_cost(result, backend, args) -> None:
         except (TypeError, ValueError):
             count = 1
         from tools import cost_ledger, tool_pricing
-        amount, status, units = tool_pricing.image_cost(backend, count)
+        amount, status, units = tool_pricing.image_cost(
+            backend, count, model=payload.get("model")
+        )
         cost_ledger.record_tool(
             "image_generate", backend=backend,
             amount_usd=amount, status=status, units=units,

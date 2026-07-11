@@ -53,6 +53,13 @@ _IMAGE_PRICE_PER_IMAGE: Dict[str, float] = {
 }
 _IMAGE_PRICE_DEFAULT = 0.04
 
+# Per-model image prices, USD — checked before the backend table so premium
+# models routed through a cheap backend (e.g. gpt-image-2 on Replicate) are
+# not billed at the backend's flat rate. Keyed by lowercase model slug.
+_IMAGE_PRICE_PER_MODEL: Dict[str, float] = {
+    "openai/gpt-image-2": 0.21,   # quality=high, 1024px (OpenAI passthrough)
+}
+
 # Per-character TTS price, USD. Free/local engines are $0.
 _TTS_PRICE_PER_CHAR: Dict[str, float] = {
     "elevenlabs": 0.00003,  # ~$0.30 / 10k chars on mid-tier plans
@@ -129,13 +136,27 @@ def crawl_cost(backend: Optional[str], page_count: int) -> Tuple[Optional[float]
     return float(price) * n, STATUS_ESTIMATED, units
 
 
-def image_cost(backend: Optional[str], image_count: int) -> Tuple[Optional[float], str, str]:
-    """Return (amount_usd, status, units_label) for image generation."""
+def image_cost(
+    backend: Optional[str],
+    image_count: int,
+    *,
+    model: Optional[str] = None,
+) -> Tuple[Optional[float], str, str]:
+    """Return (amount_usd, status, units_label) for image generation.
+
+    Price resolution: config override by model slug → per-model table →
+    config override by backend → per-backend table → default.
+    """
     n = max(int(image_count or 0), 1)
     overrides = _config_overrides().get("image", {})
     overrides = overrides if isinstance(overrides, dict) else {}
     key = (backend or "").lower().strip()
-    price = overrides.get(key, _lookup(_IMAGE_PRICE_PER_IMAGE, key, _IMAGE_PRICE_DEFAULT))
+    model_key = (model or "").lower().strip()
+    price = None
+    if model_key:
+        price = overrides.get(model_key, _IMAGE_PRICE_PER_MODEL.get(model_key))
+    if price is None:
+        price = overrides.get(key, _lookup(_IMAGE_PRICE_PER_IMAGE, key, _IMAGE_PRICE_DEFAULT))
     units = f"{n} image" if n == 1 else f"{n} images"
     return float(price) * n, STATUS_ESTIMATED, units
 

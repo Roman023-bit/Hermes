@@ -49,5 +49,52 @@ class TestHandleImageGenerateBothPaths(unittest.TestCase):
         self.assertEqual(m.call_args.kwargs["backend"], "openai")
 
 
+class TestModelBasedImagePricing(unittest.TestCase):
+    """Per-model image pricing: premium models cost more than the backend flat rate."""
+
+    def test_gpt_image_2_priced_by_model(self):
+        from tools import tool_pricing
+        with patch.object(tool_pricing, "_config_overrides", return_value={}):
+            amount, status, units = tool_pricing.image_cost(
+                "replicate", 1, model="openai/gpt-image-2"
+            )
+        self.assertAlmostEqual(amount, 0.21)
+        self.assertEqual(units, "1 image")
+
+    def test_unknown_model_falls_back_to_backend_price(self):
+        from tools import tool_pricing
+        with patch.object(tool_pricing, "_config_overrides", return_value={}):
+            amount, _, _ = tool_pricing.image_cost(
+                "replicate", 1, model="black-forest-labs/flux-1.1-pro"
+            )
+        self.assertAlmostEqual(amount, 0.04)
+
+    def test_no_model_stays_backward_compatible(self):
+        from tools import tool_pricing
+        with patch.object(tool_pricing, "_config_overrides", return_value={}):
+            amount, _, units = tool_pricing.image_cost("fal", 2)
+        self.assertAlmostEqual(amount, 0.08)
+        self.assertEqual(units, "2 images")
+
+    def test_config_override_by_model_slug_wins(self):
+        from tools import tool_pricing
+        overrides = {"image": {"openai/gpt-image-2": 0.5}}
+        with patch.object(tool_pricing, "_config_overrides", return_value=overrides):
+            amount, _, _ = tool_pricing.image_cost(
+                "replicate", 1, model="openai/gpt-image-2"
+            )
+        self.assertAlmostEqual(amount, 0.5)
+
+    def test_record_helper_passes_model_from_payload(self):
+        with patch("tools.tool_pricing.image_cost",
+                   return_value=(0.21, "estimated", "1 image")) as m, \
+             patch("tools.cost_ledger.record_tool"):
+            ig._record_image_cost(
+                '{"success": true, "image": "/x.png", "model": "openai/gpt-image-2"}',
+                "replicate", {"num_images": 1},
+            )
+        self.assertEqual(m.call_args.kwargs.get("model"), "openai/gpt-image-2")
+
+
 if __name__ == "__main__":
     unittest.main()
