@@ -140,3 +140,6 @@ apps/desktop/demo/
 
 # Local reinstall build artifacts (wheelhouse, buildenv, dist)
 /build/
+
+# Local Claude Code workspace settings (permissions/session preferences).
+.claude/
