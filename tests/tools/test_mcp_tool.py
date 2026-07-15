@@ -299,6 +299,35 @@ class TestSchemaConversion:
 
         assert schema["properties"]["filter"]["required"] == ["field"]
 
+    def test_required_pruned_when_type_is_nullable_array_form(self):
+        """Array-form ``type: ["object", "null"]`` must still get required-pruning.
+
+        Reproduces the exact reported shape: an array parameter (e.g. GitHub
+        MCP's ``issue_fields``) whose ``items`` schema declares nullability via
+        JSON Schema 2020-12 array-form type instead of a bare string. Before
+        the fix, ``type == "object"`` was False for a list, so the dangling
+        ``required`` entry survived and Google AI Studio 400'd with
+        ``items.required[0]: property is not defined``.
+        """
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "issue_fields": {
+                    "type": "array",
+                    "items": {
+                        "type": ["object", "null"],
+                        "properties": {"field": {"type": "string"}},
+                        "required": ["field", "ghost_property"],
+                    },
+                },
+            },
+        })
+
+        items_schema = schema["properties"]["issue_fields"]["items"]
+        assert items_schema["required"] == ["field"]
+
     def test_object_in_array_items_gets_properties_filled(self):
         """Array-item object schemas without properties get an empty dict."""
         from tools.mcp_tool import _normalize_mcp_input_schema
