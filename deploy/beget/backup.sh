@@ -29,7 +29,23 @@ tmp_archive="${archive}.partial"
 # main file and -wal/-shm siblings at slightly different points. Acceptable
 # for disaster recovery (SQLite replays the WAL on next open); if you need a
 # guaranteed-consistent point-in-time snapshot, stop the container first.
+#
+# GNU tar exit codes: 0 = success, 1 = some files differed (e.g. "file
+# changed as we read it" — expected when Hermes is live and writing
+# state.db-wal/logs/sessions during the read), 2 = fatal error. Only >=2
+# should abort the backup; treating 1 as fatal made every live backup of a
+# running Hermes fail before it ever produced an archive.
+set +e
 tar -C "$DATA_DIR" -czf "$tmp_archive" .
+tar_status=$?
+set -e
+if [ "$tar_status" -ge 2 ]; then
+  echo "ERROR: tar failed fatally (exit $tar_status) creating $tmp_archive" >&2
+  rm -f "$tmp_archive"
+  exit 1
+elif [ "$tar_status" -eq 1 ]; then
+  echo "NOTE: tar reported changed-while-reading files (exit 1, non-fatal for a live backup) — continuing"
+fi
 
 # Verify the archive is readable before it replaces anything or counts
 # toward retention — a corrupt backup must never look successful.
