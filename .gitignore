@@ -143,3 +143,10 @@ apps/desktop/demo/
 
 # Local Claude Code workspace settings (permissions/session preferences).
 .claude/
+
+# Beget VPS deployment: Compose-level parameters (already covered by the
+# generic .env rule above, but explicit here since this file sits right
+# next to compose.yaml and must never be confused with the repo's tracked
+# .env.example, nor with /srv/hermes/data/.env on the VPS which holds the
+# real Hermes secrets and is never part of the git checkout).
+deploy/beget/.env

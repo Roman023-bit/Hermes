@@ -1,0 +1,29 @@
+services:
+  hermes:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        HERMES_GIT_SHA: ${HERMES_GIT_SHA:-unknown}
+    image: roman023-hermes:${HERMES_IMAGE_TAG:-local}
+    container_name: hermes
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    # Playwright/Chromium needs more than Docker's 64m default shared memory,
+    # or browser tools crash with "Target closed" / OOM inside the sandbox.
+    shm_size: "1gb"
+    volumes:
+      - /srv/hermes/data:/opt/data
+    environment:
+      HERMES_UID: "${HERMES_UID:-10000}"
+      HERMES_GID: "${HERMES_GID:-10000}"
+      HERMES_DASHBOARD: "${HERMES_DASHBOARD:-0}"
+    ports:
+      - "127.0.0.1:8642:8642"
+      - "127.0.0.1:9119:9119"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    stop_grace_period: 45s
