@@ -3193,6 +3193,13 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
     * ``required`` arrays are pruned to only names that exist in
       ``properties``; otherwise Google AI Studio / Gemini 400s with
       ``property is not defined``.  See PR #4651.
+    * ``enum`` keywords holding non-string members (``enum: [true]``,
+      ``enum: [1, 2]``) are dropped.  Gemini's Schema proto only accepts
+      string enums; OpenRouter's conversion drops the containing
+      ``properties`` map instead of the offending keyword, leaving
+      ``required`` dangling and producing the same
+      ``property is not defined`` 400.  Reproduced live with GitHub MCP's
+      ``issue_write.issue_fields`` schema against google/gemini-3.5-flash.
     * MCP/Pydantic optional fields commonly arrive as
       ``anyOf: [{...}, {"type": "null"}], default: null``.  Anthropic rejects
       nullable branches in tool input schemas, so nullable unions are collapsed
@@ -3240,6 +3247,15 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
             return node
 
         repaired = {k: _repair_object_shape(v) for k, v in node.items()}
+
+        # Drop enums with non-string members: Gemini only supports string
+        # enums, and OpenRouter's conversion corrupts the parent schema
+        # rather than skipping the keyword.
+        enum_val = repaired.get("enum")
+        if isinstance(enum_val, list) and any(
+            not isinstance(v, str) for v in enum_val
+        ):
+            repaired.pop("enum")
 
         # Coerce missing / null type when the shape is clearly an object
         # (has properties or required but no type).

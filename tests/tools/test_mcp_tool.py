@@ -315,6 +315,85 @@ class TestSchemaConversion:
 
         assert schema["properties"]["items"]["items"]["properties"] == {}
 
+    def test_non_string_enum_is_dropped_from_boolean_property(self):
+        """Real GitHub MCP fixture: ``delete`` carries ``enum: [true]``.
+
+        OpenRouter's Gemini conversion drops the containing ``properties``
+        map when an ``enum`` holds non-string members, leaving ``required``
+        dangling — Google AI Studio then 400s with
+        ``items.required[0]: property is not defined``. Reproduced live
+        against google/gemini-3.5-flash on 2026-07-16.
+        """
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "issue_fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "delete": {
+                                "type": "boolean",
+                                "description": "Set to true to clear this field's current value.",
+                                "enum": [True],
+                            },
+                            "field_name": {"type": "string"},
+                        },
+                        "required": ["field_name"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": [],
+        })
+
+        items = schema["properties"]["issue_fields"]["items"]
+        assert "enum" not in items["properties"]["delete"]
+        assert items["properties"]["delete"]["type"] == "boolean"
+        assert items["required"] == ["field_name"]
+
+    def test_numeric_enum_is_dropped(self):
+        """Integer/number enums also 400 on Gemini via OpenRouter."""
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "level": {"type": "integer", "enum": [1, 2, 3]},
+            },
+        })
+
+        assert "enum" not in schema["properties"]["level"]
+        assert schema["properties"]["level"]["type"] == "integer"
+
+    def test_string_enum_is_preserved(self):
+        """String enums are valid on every provider and must survive."""
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "state": {"type": "string", "enum": ["open", "closed"]},
+            },
+        })
+
+        assert schema["properties"]["state"]["enum"] == ["open", "closed"]
+
+    def test_mixed_enum_is_dropped_entirely(self):
+        """Partial pruning would silently change semantics; drop the keyword."""
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "value": {"enum": ["auto", 0]},
+            },
+        })
+
+        assert "enum" not in schema["properties"]["value"]
+
     def test_optional_nullable_field_is_collapsed_to_non_null_schema(self):
         """Anthropic rejects MCP/Pydantic anyOf-null optional parameter schemas."""
         from tools.mcp_tool import _normalize_mcp_input_schema
