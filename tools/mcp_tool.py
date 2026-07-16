@@ -3192,12 +3192,7 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
       dict is added so ``required`` entries don't dangle.
     * ``required`` arrays are pruned to only names that exist in
       ``properties``; otherwise Google AI Studio / Gemini 400s with
-      ``property is not defined``.  See PR #4651.  This applies whether
-      the object node's ``type`` is the plain string ``"object"`` or the
-      JSON Schema 2020-12 / OpenAPI 3.1 array form (e.g.
-      ``["object", "null"]``) some MCP servers use for nullable objects --
-      the array form previously slipped past the ``== "object"`` check
-      and left dangling ``required`` entries in place.
+      ``property is not defined``.  See PR #4651.
     * MCP/Pydantic optional fields commonly arrive as
       ``anyOf: [{...}, {"type": "null"}], default: null``.  Anthropic rejects
       nullable branches in tool input schemas, so nullable unions are collapsed
@@ -3237,20 +3232,6 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
         return strip_nullable_unions(node, keep_nullable_hint=True)
 
-    def _is_object_type(type_value) -> bool:
-        """True if a JSON Schema ``type`` denotes a (possibly nullable) object.
-
-        JSON Schema 2020-12 / OpenAPI 3.1 allow ``type`` to be an array of
-        strings (e.g. ``["object", "null"]``) instead of a single string.
-        A strict ``== "object"`` check misses that form entirely, which let
-        nullable object nodes (and any dangling ``required`` entries inside
-        them) skip the repairs below -- exactly the shape that produces
-        Google AI Studio's ``property is not defined`` 400.
-        """
-        if isinstance(type_value, list):
-            return "object" in type_value
-        return type_value == "object"
-
     def _repair_object_shape(node):
         """Recursively repair object-shaped nodes: fill type, prune required."""
         if isinstance(node, list):
@@ -3267,7 +3248,7 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
         ):
             repaired["type"] = "object"
 
-        if _is_object_type(repaired.get("type")):
+        if repaired.get("type") == "object":
             # Ensure properties exists so required can reference it safely
             if "properties" not in repaired or not isinstance(
                 repaired.get("properties"), dict
@@ -3296,7 +3277,7 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
     # Ensure top-level is a well-formed object schema
     if not isinstance(normalized, dict):
         return {"type": "object", "properties": {}}
-    if _is_object_type(normalized.get("type")) and "properties" not in normalized:
+    if normalized.get("type") == "object" and "properties" not in normalized:
         normalized = {**normalized, "properties": {}}
 
     return normalized
