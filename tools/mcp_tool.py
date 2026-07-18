@@ -50,7 +50,8 @@ Example config::
 Features:
     - Stdio transport (command + args) and HTTP/StreamableHTTP transport (url)
     - SSE transport (transport: sse) for MCP servers using the SSE protocol
-    - Automatic reconnection with exponential backoff (up to 5 retries)
+    - Automatic reconnection with exponential backoff (retries indefinitely at
+      a capped interval; a WARNING is logged after 5 consecutive failures)
     - Environment variable filtering for stdio subprocesses (security)
     - Credential stripping in error messages returned to the LLM
     - Configurable per-server timeouts for tool calls and connections
@@ -84,6 +85,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import sys
@@ -260,9 +262,16 @@ if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
 
 _DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+# Consecutive reconnect failures after which we log a persistent-failure
+# WARNING once. NOT a life limit: run() keeps retrying forever past this so an
+# intermittently-available server recovers without restarting Hermes.
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+# Downward jitter factor for reconnect backoff: actual delay is
+# capped_backoff * uniform(_RECONNECT_JITTER, 1.0), so it never exceeds the cap
+# while desynchronizing simultaneous reconnects across servers.
+_RECONNECT_JITTER = 0.8
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1951,6 +1960,11 @@ class MCPServerTask:
                 self.session = None
                 raise
             except Exception as exc:
+                # Captured before nulling: whether THIS attempt had an
+                # established session (set inside _run_http/_run_stdio on
+                # connect). A drop of a live session begins a fresh outage and
+                # must reset the consecutive-failure counter below.
+                was_connected = self.session is not None
                 self.session = None
 
                 # If this is the first connection attempt, retry with backoff
@@ -2003,22 +2017,42 @@ class MCPServerTask:
                     )
                     return
 
-                retries += 1
-                if retries > _MAX_RECONNECT_RETRIES:
-                    logger.warning(
-                        "MCP server '%s' failed after %d reconnection attempts, "
-                        "giving up: %s",
-                        self.name, _MAX_RECONNECT_RETRIES, exc,
-                    )
-                    return
+                # A live session that dropped starts a fresh outage: reset the
+                # consecutive-failure counter and backoff so only CONSECUTIVE
+                # failures accumulate. Without this, blips over the whole
+                # process lifetime added up and the task gave up permanently —
+                # fatal for an intermittently-available server (a Mac that
+                # sleeps): it stayed dead until Hermes was restarted.
+                if was_connected:
+                    retries = 0
+                    backoff = 1.0
 
-                logger.warning(
-                    "MCP server '%s' connection lost (attempt %d/%d), "
-                    "reconnecting in %.0fs: %s",
-                    self.name, retries, _MAX_RECONNECT_RETRIES,
-                    backoff, exc,
+                retries += 1
+                # _MAX_RECONNECT_RETRIES is a WARNING threshold, not a life
+                # limit. After this many CONSECUTIVE failures we log once and
+                # keep retrying forever at the capped backoff, so the server
+                # recovers on its own whenever it comes back.
+                if retries == _MAX_RECONNECT_RETRIES + 1:
+                    logger.warning(
+                        "MCP server '%s' still unreachable after %d consecutive "
+                        "attempts; continuing to retry every ~%.0fs: %s",
+                        self.name, _MAX_RECONNECT_RETRIES,
+                        _MAX_BACKOFF_SECONDS, exc,
+                    )
+                elif retries <= _MAX_RECONNECT_RETRIES:
+                    logger.warning(
+                        "MCP server '%s' connection lost (attempt %d/%d), "
+                        "reconnecting in %.0fs: %s",
+                        self.name, retries, _MAX_RECONNECT_RETRIES,
+                        backoff, exc,
+                    )
+
+                # Capped backoff with downward jitter (never exceeds the cap)
+                # so multiple MCP servers don't reconnect in lockstep.
+                delay = min(backoff, _MAX_BACKOFF_SECONDS) * random.uniform(
+                    _RECONNECT_JITTER, 1.0
                 )
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(delay)
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
 
                 # Check again after sleeping
