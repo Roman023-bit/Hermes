@@ -1554,13 +1554,82 @@ polling, ошибок прав на `/opt/data`, пустого allowlist, пл�
 нового прода отношения не имеют, а относительное окно молча их зацепит либо,
 наоборот, обрежет начало запуска.
 
+Блок самодостаточен: он **сам** вычисляет `StartedAt` и **сам** содержит список
+сигнатур, ничего не наследуя из предыдущих шагов. Это принципиально — см. 10.5
+и 10.6, где контейнер перезапускается и прежнее значение становится ложным.
+
 ```bash
+set -o pipefail
+
+# Единый список сигнатур — общий для docker logs и для файловых логов.
+SIGNATURES='traceback|error|request_dump|conflict|\b40[013]\b|HTTP[^ ]* 402|Error code: 402|payment / credit error|credential pool has no usable entries'
+
+# StartedAt вычисляется ЗАНОВО при каждом запуске блока.
 START="$(docker inspect -f '{{.State.StartedAt}}' hermes)"
+START_STR="$(date -u -d "$START" '+%F %T')"
 echo "окно проверки: с $START"
+
+HITS="$(mktemp)"
+
 docker logs -t --since="$START" hermes 2>&1 \
-  | grep -Ei 'traceback|error|request_dump|conflict|\b40[013]\b|HTTP[^ ]* 402|Error code: 402|payment / credit error|credential pool has no usable entries' \
-  || echo "no matching errors"
+  | grep -Ei "$SIGNATURES" >> "$HITS" || true
+
+for f in /srv/hermes/data/logs/errors.log /srv/hermes/data/logs/gateway.log; do
+  if [ ! -r "$f" ]; then
+    echo "log_check_FAILED: недоступен $f" >&2
+    rm -f "$HITS"; exit 1
+  fi
+  awk -v start="$START_STR" '
+    /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/ {
+      if (keep && rec != "") print rec
+      rec = $0; keep = (substr($0, 1, 19) >= start); next
+    }
+    { if (keep) rec = rec "@@NL@@" $0 }
+    END { if (keep && rec != "") print rec }
+  ' "$f" | grep -Ei "$SIGNATURES" | sed 's/@@NL@@/\n/g' >> "$HITS" || true
+done
+
+if [ -s "$HITS" ]; then
+  echo "log_check_FAILED"
+  cut -c1-300 "$HITS" | head -40
+  rm -f "$HITS"; exit 1
+fi
+rm -f "$HITS"
+echo "log_check_OK"
 ```
+
+**Критерий:** вывод заканчивается `log_check_OK`. `log_check_FAILED` — стоп.
+
+Почему проверяются ещё и файлы, а не только `docker logs`:
+
+- `docker logs` живёт в пределах жизни контейнера и обрезается ротацией
+  (`max-size: 10m`, `max-file: 5` в `compose.yaml`) — при активном трафике
+  начало запуска может быть уже вытеснено;
+- `errors.log` и `gateway.log` лежат в `/srv/hermes/data/logs/` на томе,
+  переживают пересоздание контейнера и содержат записи, которых в stdout нет.
+
+Отсутствие файла трактуется как **отказ**, а не как «нечего проверять»: если
+`errors.log` пропал, это само по себе аномалия, и молча пройти её нельзя.
+
+Как устроен фильтр по времени:
+
+- `awk` собирает **запись** — строку с меткой времени плюс все последующие
+  строки без метки. Так многострочный traceback остаётся целым;
+- принадлежность окну определяется лексикографическим сравнением
+  `substr($0,1,19) >= start`. Формат `YYYY-MM-DD HH:MM:SS` сортируется как
+  текст, поэтому `mktime` и возня с часовыми поясами не нужны. Метки в файлах и
+  `StartedAt` — обе в UTC (`timedatectl` на Aeza показывает `Etc/UTC`);
+- запись склеивается через `@@NL@@`, чтобы `grep` видел её одной строкой, после
+  чего `sed` возвращает переносы. Без этого `grep` напечатал бы только строку с
+  совпадением и отрезал бы остальной traceback.
+
+> ⚠️ Вывод при отказе может содержать чувствительные данные. Проверено на живом
+> прогоне: сообщение об ошибке OpenRouter включает URL вида
+> `openrouter.ai/workspaces/default/keys/<хеш>`. Не вставлять вывод целиком в
+> публичные issue, чаты и paste-сервисы.
+>
+> `cut -c1-300` — не косметика: одна строка ошибки 402 с вложенным
+> `previous_errors` заняла ~2000 символов и вытеснила из вывода всё остальное.
 
 > **Про 402 и платёжные сигнатуры.** `40[013]` покрывает 400/401/403, но не
 > `402 Payment Required` — а это самая тихая из отказных ситуаций: провайдер
@@ -1628,16 +1697,56 @@ docker logs hermes 2>&1 | grep -Ei 'cron|scheduler' | tail -20
 После каждой проверки:
 
 ```bash
+set -o pipefail
+
+# Единый список сигнатур — общий для docker logs и для файловых логов.
+SIGNATURES='traceback|error|request_dump|conflict|\b40[013]\b|HTTP[^ ]* 402|Error code: 402|payment / credit error|credential pool has no usable entries'
+
+# StartedAt вычисляется ЗАНОВО при каждом запуске блока.
+START="$(docker inspect -f '{{.State.StartedAt}}' hermes)"
+START_STR="$(date -u -d "$START" '+%F %T')"
+echo "окно проверки: с $START"
+
+HITS="$(mktemp)"
+
 docker logs -t --since="$START" hermes 2>&1 \
-  | grep -Ei 'traceback|error|request_dump|conflict|\b40[013]\b|HTTP[^ ]* 402|Error code: 402|payment / credit error|credential pool has no usable entries' \
-  || echo "clean"
+  | grep -Ei "$SIGNATURES" >> "$HITS" || true
+
+for f in /srv/hermes/data/logs/errors.log /srv/hermes/data/logs/gateway.log; do
+  if [ ! -r "$f" ]; then
+    echo "log_check_FAILED: недоступен $f" >&2
+    rm -f "$HITS"; exit 1
+  fi
+  awk -v start="$START_STR" '
+    /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/ {
+      if (keep && rec != "") print rec
+      rec = $0; keep = (substr($0, 1, 19) >= start); next
+    }
+    { if (keep) rec = rec "@@NL@@" $0 }
+    END { if (keep && rec != "") print rec }
+  ' "$f" | grep -Ei "$SIGNATURES" | sed 's/@@NL@@/\n/g' >> "$HITS" || true
+done
+
+if [ -s "$HITS" ]; then
+  echo "log_check_FAILED"
+  cut -c1-300 "$HITS" | head -40
+  rm -f "$HITS"; exit 1
+fi
+rm -f "$HITS"
+echo "log_check_OK"
 ```
 
-> `$START` — переменная из 10.2. Шаблон здесь **тот же самый**, что и там, и это
-> намеренно. В прежней редакции шаблон 10.4 был короче (`error` и `conflict`
-> отсутствовали), из-за чего проверка после функционального теста была слабее
-> проверки при старте — расхождение, которое невозможно заметить, пока оно не
-> пропустит ошибку. Держать оба списка идентичными.
+**Критерий:** `log_check_OK` после **каждой** функциональной проверки.
+
+> Блок дословно совпадает с блоком из 10.2, включая пересчёт `StartedAt` и
+> список сигнатур. Он **не** переиспользует переменные из 10.2 — между этими
+> шагами контейнер мог быть перезапущен, и унаследованный `START` указывал бы на
+> прошлую жизнь контейнера, тихо расширяя окно на чужие логи.
+>
+> В прежней редакции список сигнатур здесь был короче (без `error` и
+> `conflict`), из-за чего проверка после функционального теста была слабее
+> стартовой. Именно на этом 2026-07-25 был пропущен `402`. Держать списки
+> идентичными.
 
 ### 10.5 Проверка восстановления
 
@@ -1650,6 +1759,13 @@ sleep 5 && docker inspect -f '{{.State.Status}} restart={{.RestartCount}}' herme
 ```
 
 Затем снова отправить боту сообщение — ответ должен прийти.
+
+⚠️ **После рестарта `StartedAt` изменился.** Прогнать блок проверки логов из
+10.2 **заново, целиком** — он пересчитает окно сам. Категорически нельзя
+переиспользовать `$START`, полученный до рестарта: он старше текущего запуска,
+и проверка захватит логи прошлой жизни контейнера, где ошибки уже разобраны.
+Практический эффект — «провал» на давно закрытых записях либо, наоборот,
+ложное спокойствие от того, что свежие строки утонули в старых.
 
 ### 10.6 Reboot VPS
 
@@ -1685,6 +1801,12 @@ ssh -i "$NEW_KEY" root@"$NEW_IP" \
 
 **Критерий:** `running`. Затем отправить боту сообщение и убедиться, что ответ
 приходит после перезагрузки.
+
+⚠️ Перезагрузка меняет `StartedAt` так же, как и `docker restart`. Прогнать блок
+проверки логов из 10.2 **заново**; он пересчитает окно сам. Файловые логи
+(`errors.log`, `gateway.log`) переживают перезагрузку и остаются на томе,
+поэтому фильтр по времени здесь особенно важен — без него в вывод попадёт вся
+история до reboot.
 
 ---
 
