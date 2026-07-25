@@ -385,8 +385,17 @@ sshd -T | grep -iE '^(passwordauthentication|kbdinteractiveauthentication|permit
 ```text
 passwordauthentication no
 kbdinteractiveauthentication no
-permitrootlogin prohibit-password
+permitrootlogin without-password
 ```
+
+> ⚠️ Третья строка — **не опечатка**. В конфиге пишется
+> `PermitRootLogin prohibit-password`, но `sshd -T` нормализует значение к
+> устаревшему синониму и печатает `without-password`. Это одно и то же
+> (проверено на Aeza, OpenSSH из Ubuntu 24.04). Ждать в выводе
+> `prohibit-password` — значит завалить проверку на ровном месте.
+>
+> Дополнительно полезно увидеть `pubkeyauthentication yes` — без него
+> отключение пароля означало бы потерю доступа.
 
 Если что-то из этого отличается — найти и обезвредить дроп-ин, который
 перекрывает настройку:
@@ -406,6 +415,33 @@ sshd -T | grep -iE '^(passwordauthentication|kbdinteractiveauthentication|permit
 
 > Не закрывать текущую SSH-сессию, пока `sshd -T` не показал `no` **и** вторая
 > сессия по ключу (проверка из 4.3) не подтвердила вход.
+
+Учесть: `sshd -T` читает **файлы**, а не состояние работающего демона. Если
+конфиг правили, но не перезагрузили сервис, вывод покажет новые значения,
+которых в памяти демона ещё нет. Поэтому после правок — обязательный reload и проверка
+живой сессией:
+
+```bash
+sshd -t && systemctl reload ssh && systemctl is-active ssh
+```
+
+**[MAC]** — позитивный тест (доступ не потерян) и негативный (пароль больше не
+принимается):
+
+```bash
+ssh -i "$NEW_KEY" -o BatchMode=yes root@"$NEW_IP" 'echo key_access_OK'
+```
+
+```bash
+ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password \
+    -o NumberOfPasswordPrompts=1 -o BatchMode=yes \
+    root@"$NEW_IP" 'echo THIS_SHOULD_NOT_PRINT' 2>&1 | tail -1
+```
+
+**Критерий:** первая команда печатает `key_access_OK`, вторая —
+`Permission denied (publickey).`. Только вывод второй команды доказывает, что
+парольный вход действительно закрыт: наличие строки в конфиге само по себе не
+доказывает ничего.
 
 ### 4.6 Swap 2 ГБ (при необходимости для сборки)
 
