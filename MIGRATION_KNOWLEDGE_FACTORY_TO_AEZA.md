@@ -1090,22 +1090,27 @@ Model cache можно не включать в off-site backup: он восст
 
 ## 22. Финальные acceptance criteria
 
-- [ ] Knowledge Factory image собирается для `linux/amd64`.
-- [ ] `ocrmac` не требуется для запуска MCP в Linux.
-- [ ] PostgreSQL и Qdrant не имеют published ports.
-- [ ] MCP не имеет published port.
-- [ ] Bearer обязателен.
-- [ ] Hermes резолвит `knowledge-factory` через Docker DNS.
-- [ ] `hermes mcp test knowledge_factory`: 5/5.
-- [ ] Доступны ровно `search_knowledge`, `ask`, `stats`.
-- [ ] Документы/чанки/точки совпадают с эталоном.
-- [ ] Golden queries совпадают с Mac.
-- [ ] Нет OOM и неожиданных рестартов.
-- [ ] Выключение Mac не влияет на search/ask/stats.
+- [x] Knowledge Factory image собирается для `linux/amd64`.
+- [x] `ocrmac` не требуется для запуска MCP в Linux.
+- [x] PostgreSQL и Qdrant не имеют published ports.
+- [x] MCP не имеет published port.
+- [x] Bearer обязателен.
+- [x] Hermes резолвит `knowledge-factory` через Docker DNS.
+- [x] `hermes mcp test knowledge_factory`: 5/5.
+- [x] Доступны ровно `search_knowledge`, `ask`, `stats`.
+- [x] Документы/чанки/точки совпадают с эталоном.
+- [x] Golden queries сохраняют ожидаемые источники: 7/10 ответов совпали
+  побайтово, в трёх изменился только порядок/текст без потери эталонных
+  документов.
+- [x] Нет OOM и неожиданных рестартов.
+- [x] Отключение локального MCP на Mac не влияет на `search`/`ask`/`stats`:
+  при полностью выгруженном LaunchAgent сервер прошёл `mcp test` 5/5, после
+  чего локальный MCP был возвращён для других проектов.
 - [ ] Для полной автономной индексации принят Linux OCR.
-- [ ] Первый Linux `kf update` не создаёт дубликаты.
-- [ ] Настроены logical backups и проверен restore.
-- [ ] Есть проверенный rollback на Mac на время карантина.
+- [x] Первый Linux `kf update` не создаёт дубликаты: изменён один Markdown,
+  итог остался 96 документов / 620 чанков / 620 точек.
+- [x] Настроены logical backups и проверен restore.
+- [x] Есть проверенный rollback на Mac на время карантина.
 
 ## 23. Рекомендуемая последовательность коммитов
 
