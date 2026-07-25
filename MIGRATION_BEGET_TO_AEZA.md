@@ -837,10 +837,11 @@ install -d -m 0750 /srv/hermes/data/workspace
 
 ## Фаза 8 — Сборка образа на Aeza ДО cutover (gateway НЕ запускать)
 
-⚠️ **В перенесённом `/srv/hermes/data/.env` уже лежит боевой Telegram
-token.** Любой запуск `gateway run` начнёт polling и даст конфликт с
-работающим Beget. Поэтому здесь — только сборка и smoke-тесты, которые
-**не** стартуют gateway.
+⚠️ **В перенесённом `/srv/hermes/data/.env` уже лежит боевой Telegram token.**
+Любой запуск контейнера с этим каталогом начнёт polling и даст конфликт с
+работающим Beget — включая `docker compose run --rm`, см. 8.1. Поэтому здесь
+только `config`, `build` и смок-тест из 8.2, который физически не может выйти
+в сеть.
 
 **[AEZA]**
 
@@ -862,21 +863,67 @@ docker compose -f deploy/beget/compose.yaml config
 docker compose -f deploy/beget/compose.yaml build --pull
 ```
 
-**[AEZA]** — smoke-тесты через `run --rm` (одноразовый контейнер, gateway/polling НЕ стартует):
+### 8.1 🔴 `docker compose run --rm` ЗАПУСКАЕТ gateway — не использовать
 
-```bash
-docker compose -f deploy/beget/compose.yaml run --rm hermes hermes --version
+Прежняя редакция этого раздела предлагала смок-тесты вида
+`docker compose run --rm hermes hermes doctor` и утверждала, что gateway при
+этом не стартует. **Это неверно, проверено на живой миграции 2026-07-25.**
+
+Образ построен на s6-overlay. `ENTRYPOINT` — это `/init`, который поднимает
+**всё дерево супервизии**, включая службу `gateway-default`, и лишь потом
+запускает переданную команду как «main program». Команда в конце строки не
+отменяет службы: `doctor` выполняется параллельно с уже запущенным gateway.
+
+Что произошло фактически: gateway внутри одноразового контейнера прочитал
+боевой токен из смонтированного `/srv/hermes/data/.env`, обратился к Telegram,
+и работающий Beget получил
+
+```text
+Telegram polling conflict (1/5) — Conflict: terminated by other getUpdates
+request; make sure that only one bot instance is running
 ```
+
+Beget восстановился сам (штатный retry, ~20 с), но принцип «один токен — один
+gateway» был нарушен. В логах контейнера при этом видна характерная улика:
+
+```text
+WARNING gateway.run: Shutdown context: signal=SIGTERM
+  parent_name=s6-supervise parent_cmdline='s6-supervise gateway-default'
+```
+
+Если эта строка появилась — gateway стартовал, чего на этом этапе быть не
+должно.
+
+**Запрещено до cutover:** `up`, `up -d`, `run`, `start`, `gateway run` — то
+есть **любой** запуск контейнера из этого образа с примонтированным
+`/srv/hermes/data`, независимо от переданной команды.
+
+### 8.2 Безопасный смок-тест образа
+
+Проверять образ можно, но тремя ограничениями сразу, каждое из которых
+самостоятельно блокирует polling:
+
+- `--entrypoint sh` — `/init` не запускается, дерева супервизии нет;
+- **без** `-v /srv/hermes/data` — боевого `.env` с токеном в контейнере нет;
+- `--network=none` — сети нет физически.
 
 **[AEZA]**
 
 ```bash
-docker compose -f deploy/beget/compose.yaml run --rm hermes hermes doctor
+docker run --rm --network=none --entrypoint sh \
+  "roman023-hermes:$(git -C /srv/hermes/app rev-parse --short=12 HEAD)" \
+  -c '. /opt/hermes/.venv/bin/activate && hermes --version'
 ```
 
-> Не выполнять здесь `up -d`, `gateway run`, `gateway start` или любую команду,
-> запускающую polling. Только `config`, `build`, `run --rm ... --version`,
-> `run --rm ... doctor`.
+**Критерий:** печатается версия и вшитый upstream-коммит, например
+`Hermes Agent v0.16.0 (2026.6.5) · upstream 4dba96bf` — SHA должен совпасть с
+`OLD_SHA`. Это доказывает, что образ собран, Python и зависимости на месте, а
+`HERMES_GIT_SHA` попал внутрь.
+
+> `hermes doctor` на этом этапе **не запускать**: его ценность в проверке
+> конфига и ключей из `/opt/data`, а это требует монтирования боевых данных,
+> то есть ровно того, что запрещено. Полноценный `doctor` выполняется после
+> cutover — Фаза 10.3, когда Beget уже остановлен.
 
 ---
 
