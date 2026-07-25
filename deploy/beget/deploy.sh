@@ -13,6 +13,11 @@ COMPOSE_FILE="deploy/beget/compose.yaml"
 
 cd "$APP_DIR"
 
+ensure_internal_network() {
+  docker network inspect hermes-internal >/dev/null 2>&1 ||
+    docker network create hermes-internal >/dev/null
+}
+
 echo "== 1/9: verifying clean checkout =="
 if [ -n "$(git status --porcelain)" ]; then
   echo "ERROR: $APP_DIR has local changes — refusing to deploy over them:" >&2
@@ -31,6 +36,7 @@ echo "Rollback point: commit=$prev_commit image_tag=$prev_tag"
 rollback() {
   echo "!! Deploy failed — rolling back to commit=$prev_commit image_tag=$prev_tag" >&2
   git checkout --quiet "$prev_commit" || true
+  ensure_internal_network
   HERMES_GIT_SHA="$prev_commit" HERMES_IMAGE_TAG="$prev_tag" \
     docker compose -f "$COMPOSE_FILE" up -d --build || true
   echo "!! Rolled back. Data volume was not touched. Investigate before retrying." >&2
@@ -50,6 +56,7 @@ fi
 
 export HERMES_GIT_SHA="$new_commit"
 export HERMES_IMAGE_TAG="$(git rev-parse --short=12 HEAD)"
+ensure_internal_network
 echo "== 6/9: building image (HERMES_GIT_SHA=$HERMES_GIT_SHA HERMES_IMAGE_TAG=$HERMES_IMAGE_TAG) =="
 docker compose -f "$COMPOSE_FILE" build --pull
 

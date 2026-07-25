@@ -18,8 +18,9 @@ services:
       HERMES_UID: "${HERMES_UID:-10000}"
       HERMES_GID: "${HERMES_GID:-10000}"
       HERMES_DASHBOARD: "${HERMES_DASHBOARD:-0}"
-    # Docker's embedded DNS does not forward Tailscale MagicDNS names.
-    # Keep the Mac-hosted knowledge_factory MCP reachable from the container.
+    # Rollback path during the Knowledge Factory quarantine. Production uses
+    # the internal Docker DNS name `knowledge-factory`; remove this entry only
+    # after the 3–7 day quarantine and a final rollback drill.
     extra_hosts:
       - "macbook-air-od.tail0483d9.ts.net:100.104.217.61"
     ports:
@@ -31,3 +32,10 @@ services:
         max-size: "10m"
         max-file: "5"
     stop_grace_period: 45s
+    networks:
+      - default
+      - hermes-internal
+
+networks:
+  hermes-internal:
+    external: true
