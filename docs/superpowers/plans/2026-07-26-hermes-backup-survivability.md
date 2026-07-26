@@ -5785,6 +5785,9 @@ if [ -z "${KF_PULL_LOCKED:-}" ]; then
 fi
 ```
 
+`SCRIPT_DIR` — каталог самого скрипта, поэтому обёртка берётся оттуда же, куда
+Task 18 её установит.
+
 Создать `scripts/offsite_lock.py`:
 
 ```python
@@ -5800,6 +5803,7 @@ leaves the uplink blocked. macOS ships no flock(1).
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -5812,6 +5816,52 @@ from pathlib import Path
 # Constant, not an environment variable: the path is behaviour, not a
 # secret, and tests point elsewhere with --lock.
 DEFAULT_LOCK = Path.home() / "Library/Application Support/offsite-sync/network.lock"
+CONTENDED = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK})
+
+
+def _acquire(lock: Path, wait_seconds: int) -> int:
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    # O_CREAT's mode applies only to a new file, and this one is permanent.
+    os.fchmod(fd, 0o600)
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError as error:
+            # Only contention is retryable: EBADF or ENOLCK mean the file is
+            # wrong, not that somebody else holds it.
+            if error.errno not in CONTENDED:
+                os.close(fd)
+                raise
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                print("offsite_pull_FAILED lock_timeout", file=sys.stderr)
+                raise SystemExit(1) from None
+            time.sleep(5)
+
+
+def _write_meta(lock: Path, owner: str) -> Path:
+    meta = lock.with_name(lock.name + ".meta.json")
+    tmp = meta.with_name(f".{meta.name}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "owner": owner,
+                    "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, meta)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+    return meta
 
 
 def main() -> int:
@@ -5826,40 +5876,17 @@ def main() -> int:
         print("offsite_lock_FAILED no command", file=sys.stderr)
         return 2
 
-    args.lock.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(args.lock, os.O_RDWR | os.O_CREAT, 0o600)
-    deadline = time.monotonic() + args.wait
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except OSError:
-            if time.monotonic() >= deadline:
-                print("offsite_pull_FAILED lock_timeout", file=sys.stderr)
-                return 1
-            time.sleep(5)
-
-    meta = args.lock.with_name(args.lock.name + ".meta.json")
-    tmp = meta.with_name(f".{meta.name}.tmp")
-    tmp.write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "owner": args.owner,
-                "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            }
-        ),
-        encoding="utf-8",
-    )
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, meta)
+    fd = _acquire(args.lock, args.wait)
+    meta = None
     try:
+        meta = _write_meta(args.lock, args.owner)
         # Hand the descriptor to the child: if this wrapper is killed, the
         # lock must stay held while the transfer it started is still
         # running, or a second puller would join it on one narrow uplink.
         return subprocess.run(command, check=False, pass_fds=(fd,)).returncode
     finally:
-        meta.unlink(missing_ok=True)
+        if meta is not None:
+            meta.unlink(missing_ok=True)
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
@@ -5876,80 +5903,96 @@ def test_script_reexecs_itself_under_the_shared_flock():
     assert "offsite_lock.py" in text
     assert "KF_PULL_LOCKED" in text
     # No home-grown mkdir protocol: the lock must be the shared flock file.
-    assert "mkdir \"$LOCK_DIR\"" not in text
+    assert 'mkdir "$LOCK_DIR"' not in text
+
+
+def test_wrapper_only_retries_contention():
+    source = (REPO / "scripts" / "offsite_lock.py").read_text()
+    assert "CONTENDED" in source
+    assert "os.fchmod(fd, 0o600)" in source
+    assert "meta.json" in source
+
+
+def test_wrapper_releases_the_lock_when_the_child_finishes(tmp_path):
+    import subprocess
+    import sys
+
+    lock = tmp_path / "network.lock"
+    wrapper = REPO / "scripts" / "offsite_lock.py"
+    for _ in range(2):
+        result = subprocess.run(
+            [sys.executable, str(wrapper), "--owner", "test", "--wait", "1",
+             "--lock", str(lock), "--", "true"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
 
 
 def test_lock_outlives_a_killed_wrapper_while_the_child_runs(tmp_path):
     """SIGKILL on the wrapper must not hand the uplink to a second puller
     while the rsync it launched is still transferring."""
+    import os
     import signal
     import subprocess
     import sys
     import time
 
     lock = tmp_path / "network.lock"
+    pidfile = tmp_path / "child.pid"
     wrapper = REPO / "scripts" / "offsite_lock.py"
     holder = subprocess.Popen(
         [
             sys.executable, str(wrapper), "--owner", "kf-pull", "--lock", str(lock),
-            "--", "sleep", "5",
+            "--", "sh", "-c", f"echo $$ > {pidfile}; sleep 30",
         ]
     )
-    time.sleep(1)
-    holder.send_signal(signal.SIGKILL)
-    holder.wait()
+    try:
+        for _ in range(50):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.1)
+        child_pid = int(pidfile.read_text().strip())
+        holder.send_signal(signal.SIGKILL)
+        holder.wait()
 
-    contender = subprocess.run(
-        [
-            sys.executable, str(wrapper), "--owner", "hermes-pull", "--wait", "1",
-            "--lock", str(lock), "--", "true",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert contender.returncode == 1
-    assert "lock_timeout" in contender.stderr
-    subprocess.run(["pkill", "-f", "sleep 5"], check=False)
-
-
-def test_wrapper_releases_the_lock_when_the_child_dies(tmp_path):
-    import subprocess
-    import sys
-
-    lock = tmp_path / "network.lock"
-    wrapper = REPO / "scripts" / "offsite_lock.py"
-    first = subprocess.run(
-        [sys.executable, str(wrapper), "--owner", "test", "--lock", str(lock), "--", "true"],
-        capture_output=True,
-        text=True,
-    )
-    assert first.returncode == 0
-    # A finished holder must leave the uplink free for the next run.
-    second = subprocess.run(
-        [sys.executable, str(wrapper), "--owner", "test", "--wait", "1", "--lock", str(lock), "--", "true"],
-        capture_output=True,
-        text=True,
-    )
-    assert second.returncode == 0
+        contender = subprocess.run(
+            [sys.executable, str(wrapper), "--owner", "hermes-pull", "--wait", "1",
+             "--lock", str(lock), "--", "true"],
+            capture_output=True,
+            text=True,
+        )
+        assert contender.returncode == 1
+        assert "lock_timeout" in contender.stderr
+    finally:
+        # Kill exactly the child we started, never a pattern match.
+        os.kill(child_pid, signal.SIGKILL)
 ```
 
 - [ ] **Step 4: Прогнать тесты**
 
-Run: `cd /Users/romanmizanov/Documents/BD/knowledge-factory && uv run pytest tests/test_pull_filevault_gate.py -v`
-Expected: PASS, 3 теста.
+```bash
+cd /Users/romanmizanov/Documents/BD/knowledge-factory
+bash -n scripts/pull_backups_from_aeza.sh
+uv run pytest tests/test_pull_filevault_gate.py -v
+uv run pytest -q
+```
 
-- [ ] **Step 5: Прогнать весь набор KF**
+Expected: `bash -n` молчит; 7 тестов гейта проходят; полный набор — 228 passed,
+1 skipped.
 
-Run: `cd /Users/romanmizanov/Documents/BD/knowledge-factory && uv run pytest -q`
-Expected: PASS — 216 passed, 1 skipped.
-
-- [ ] **Step 6: Коммит**
+- [ ] **Step 5: Локальный коммит**
 
 ```bash
 cd /Users/romanmizanov/Documents/BD/knowledge-factory
-git add scripts/pull_backups_from_aeza.sh tests/test_pull_filevault_gate.py
+git add scripts/pull_backups_from_aeza.sh scripts/offsite_lock.py \
+        tests/test_pull_filevault_gate.py
 git commit -m "fix(offsite): gate the pull on FileVault and share the network lock"
 ```
+
+Живой LaunchAgent сейчас запускает **копию** скрипта из
+`~/.local/share/knowledge-factory/`, а не файл репозитория — установка обеих
+частей входит в Task 18.
 
 ---
 
@@ -6061,6 +6104,37 @@ Expected: `hermes_offsite_pull_OK`, `hermes_freshness_OK`,
 `hermes_restore_drill_OK sessions=2 skills=78 plugins=3 cron_jobs=<N> unclassified=<N>`.
 Если `unclassified` больше нуля — посмотреть `INVENTORY.jsonl` и решить,
 дополнять ли `ESSENTIAL_RULES`.
+
+- [ ] **Step 5a: Установить исправленные скрипты Knowledge Factory**
+
+LaunchAgent запускает копию в `~/.local/share/knowledge-factory/`, а не файл
+репозитория, поэтому правки Task 16 и 17 без этого шага никуда не доедут.
+Обёртка ищет `offsite_lock.py` рядом с собой, значит обе части ставятся в один
+каталог.
+
+```bash
+KF=/Users/romanmizanov/Documents/BD/knowledge-factory
+RUNTIME=~/.local/share/knowledge-factory
+launchctl bootout gui/$(id -u)/com.knowledge-factory.backup-pull 2>/dev/null || true
+install -m 0755 "$KF/scripts/pull_backups_from_aeza.sh" "$RUNTIME/pull_backups_from_aeza.sh"
+install -m 0755 "$KF/scripts/offsite_lock.py" "$RUNTIME/offsite_lock.py"
+diff -q "$KF/scripts/pull_backups_from_aeza.sh" "$RUNTIME/pull_backups_from_aeza.sh"
+diff -q "$KF/scripts/offsite_lock.py" "$RUNTIME/offsite_lock.py"
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.knowledge-factory.backup-pull.plist
+launchctl list | grep knowledge-factory.backup-pull
+```
+
+Исправленный `restore_drill.sh` и `state_parser.py` живут на Aeza в
+`/srv/knowledge-factory/app` — они приедут туда обычным `git pull` в Step 2,
+если репозиторий KF на сервере отслеживает ту же ветку; проверить:
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
+  'grep -c "source \"\$latest/STATE\"" /srv/knowledge-factory/app/scripts/restore_drill.sh || true'
+```
+
+Expected: `0`. Пока там `1`, еженедельный drill исполняет содержимое файла из
+каталога бэкапов от root.
 
 - [ ] **Step 6: Установить агенты**
 
