@@ -19,6 +19,9 @@
 - внутренний healthcheck выполняется каждые 10 минут;
 - off-site копия хранится на Mac и обновляется LaunchAgent
   `com.knowledge-factory.backup-pull`;
+- исходные документы автоматически зеркалируются с Mac на Aeza каждые
+  10 минут через `com.knowledge-factory.sync-to-aeza`; после подтверждённого
+  SHA-манифеста обе фабрики независимо выполняют `kf update`;
 - локальный MCP на Mac оставлен работающим как rollback и для других
   проектов; локальный автоиндексатор отключён на время карантина;
 - Этап B (Linux OCR, относительные пути и серверный scheduler обновлений)
@@ -1129,3 +1132,129 @@ Model cache можно не включать в off-site backup: он восст
 
 Не объединять path migration, Linux OCR и первый production cutover в один
 коммит или один необратимый шаг.
+
+## 24. Синхронное пополнение Mac и Aeza
+
+Реализовано 2026-07-26. Mac остаётся единственным источником истины для
+документов:
+
+```text
+Цифровой мозг на Mac
+   ├── локальный kf update
+   └── filtered rsync по SSH
+          └── SHA-манифест совпал
+                 └── kf update на Aeza
+```
+
+PostgreSQL и Qdrant между машинами не копируются. Каждая фабрика строит свой
+индекс из одинакового дерева источников.
+
+### 24.1. Локальная автоматика
+
+- LaunchAgent:
+  `~/Library/LaunchAgents/com.knowledge-factory.sync-to-aeza.plist`;
+- исходный plist:
+  `deploy/macos/com.knowledge-factory.sync-to-aeza.plist`;
+- установщик:
+  `scripts/install_sync_launchagent.sh`;
+- рабочая копия скриптов вне TCC-защищённой папки Documents:
+  `~/.local/share/knowledge-factory/sync-runtime`;
+- поведенческая конфигурация:
+  `~/.config/knowledge-factory/sync.conf`;
+- закрытый ключ:
+  `~/.ssh/kf_sync_aeza`, mode 0600;
+- stdout/stderr:
+  `~/Library/Logs/knowledge-factory/kf-sync.{out,err}.log`;
+- интервал: 600 секунд.
+
+LaunchAgent запускается через `~/.hermes/bin/uv`: этот runtime уже имеет
+разрешение macOS на чтение Documents. Запуск нового `/bin/bash` напрямую из
+Documents блокируется TCC с `Operation not permitted`.
+
+Старый `com.knowledge-factory.autoupdate` остаётся disabled. Его функцию
+выполняет новый sync-wrapper, который сначала обновляет локальную фабрику.
+
+### 24.2. Фильтр и целостность
+
+Передаются только расширения, которые понимает `kf.sources.scan`:
+`.md`, `.txt`, `.pdf`, `.docx`, `.csv`. Исключаются `.git`, virtualenv,
+`node_modules`, cache и build-каталоги.
+
+`scripts/source_manifest.py` строит детерминированный SHA-256 manifest.
+Серверный update не запускается, пока локальный и удалённый manifests не
+совпадут побайтово.
+
+Удаление включено через `--delete-delay`, но fail-closed:
+
+- источник обязан содержать карту базы и минимум 50 поддерживаемых файлов;
+- максимум 10 удаляемых документов за один цикл;
+- максимум 20% от удалённого manifest;
+- число удалений считается по путям двух manifests, а не по строкам rsync;
+- при превышении лимита rsync не меняет сервер;
+- каталоги защищены от удаления, поэтому неиндексируемые вложения не создают
+  шум и ложный расход deletion budget.
+
+### 24.3. Ограниченный SSH-контур
+
+Автоматика не использует основной root-ключ. На Aeza создан пользователь
+`kf-sync` и отдельный forced-command ключ с `restrict`.
+
+Dispatcher `/usr/local/sbin/kf-sync-dispatch` разрешает только:
+
+1. принимающий rsync строго в
+   `/srv/knowledge-factory/data/sources/`;
+2. `kf-manifest`;
+3. `kf-update` через единственную sudo-команду
+   `/usr/local/sbin/kf-update-production`.
+
+Произвольная команда возвращает exit code 126. Wrapper обновления использует
+`flock`, проверяет Compose, source count, последний статус update и полный
+production healthcheck.
+
+### 24.4. Подтверждённые сценарии
+
+- добавление Markdown: обе базы 97 документов / 621 чанк;
+- изменение: старый чанк заменён новым на обеих машинах;
+- перенос без delete: остановка на различии manifests, серверный update не
+  запущен;
+- перенос и удаление с delete: оба индекса обновлены;
+- после удаления тестового знания обе базы вернулись к 96/620/620;
+- 11 удалений при лимите 10 остановлены до изменения сервера;
+- недоступная Aeza завершает цикл ошибкой до локального update/rsync;
+- параллельный запуск пропускается по lock;
+- LaunchAgent прошёл реальный цикл с exit code 0.
+
+### 24.5. Проверка и rollback
+
+```bash
+launchctl print gui/$(id -u)/com.knowledge-factory.sync-to-aeza
+tail -100 ~/Library/Logs/knowledge-factory/kf-sync.out.log
+tail -100 ~/Library/Logs/knowledge-factory/kf-sync.err.log
+```
+
+На Aeza:
+
+```bash
+docker exec knowledge-factory kf stats
+/srv/knowledge-factory/app/scripts/healthcheck_production.sh
+```
+
+Остановить синхронизацию без остановки обеих фабрик:
+
+```bash
+launchctl bootout \
+  gui/$(id -u)/com.knowledge-factory.sync-to-aeza
+```
+
+Для временного запрета удалений установить `ALLOW_DELETE=0` в
+`~/.config/knowledge-factory/sync.conf`. Резервные копии конфигурации первого
+включения:
+
+- Mac:
+  `~/.local/share/knowledge-factory/sync-backups/20260726T083402Z`;
+- Aeza:
+  `/srv/knowledge-factory/backups/sync-config-20260726T083402Z`.
+
+Linux OCR по-прежнему выключен. Новые Markdown/TXT/DOCX/CSV и PDF с текстовым
+слоем синхронизируются автоматически; новые сканированные PDF будут полностью
+одинаково индексироваться только после приёмки Этапа B.
