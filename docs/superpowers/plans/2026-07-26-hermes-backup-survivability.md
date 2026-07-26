@@ -6021,20 +6021,33 @@ git commit -m "fix(offsite): gate the pull on FileVault and share the network lo
 На Aeza до сих пор `restore_drill.sh` делает `source` файла из каталога
 бэкапов, и делает это от root по таймеру.
 
+Документированная в runbook команда `git bundle create --all` здесь **не
+годится**: git-корень — `/Users/romanmizanov/Documents/BD`, поэтому она упакует
+монорепозиторий целиком, а не серверную историю Knowledge Factory. Нужен именно
+subtree split.
+
 - [ ] **Step A1: Собрать bundle из subtree split**
 
 ```bash
 set -euo pipefail
 cd /Users/romanmizanov/Documents/BD
 test -z "$(git status --porcelain)"
+
 SPLIT="$(git subtree split --prefix=knowledge-factory HEAD)"
 echo "split: $SPLIT"
-git branch -f kf-deploy "$SPLIT"
+test "$SPLIT" = 45827a7e3bf6ad3d2cd67e72b7292957ea6b6088
+
+# Временная ветка нужна лишь как имя для bundle: git bundle пакует ссылки,
+# а не голые SHA. Удаляется в Step A8.
+git branch -f kf-main "$SPLIT"
 rm -f /tmp/kf-deploy.bundle
-git bundle create /tmp/kf-deploy.bundle kf-deploy
+git bundle create /tmp/kf-deploy.bundle kf-main
 git bundle verify /tmp/kf-deploy.bundle
 shasum -a 256 /tmp/kf-deploy.bundle
 ```
+
+Expected: `bundle verify` подтверждает `refs/heads/kf-main`; SHA-256 записать
+для сверки на сервере.
 
 - [ ] **Step A2: Остановить таймер и убедиться, что drill не выполняется**
 
@@ -6047,22 +6060,29 @@ systemctl is-active knowledge-factory-restore-drill.service || true
 EOF
 ```
 
-Expected: таймер `inactive`, сервис `inactive`. Если сервис `active` —
-дождаться завершения, а не обновлять код под работающим drill'ом.
+Expected: и таймер, и сервис — `inactive`. Если сервис активен, дождаться его
+завершения: обновлять код под работающим drill'ом нельзя.
 
-- [ ] **Step A3: Передать и проверить bundle**
+- [ ] **Step A3: Передать во временный файл и проверить**
 
 ```bash
 scp -i ~/.ssh/aeza_hermes /tmp/kf-deploy.bundle \
-  root@138.124.108.97:/srv/knowledge-factory/staging/
-ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
-  'sha256sum /srv/knowledge-factory/staging/kf-deploy.bundle; \
-   git -C /srv/knowledge-factory/app bundle verify /srv/knowledge-factory/staging/kf-deploy.bundle'
+  root@138.124.108.97:/srv/knowledge-factory/staging/kf-deploy.bundle.incoming
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+cd /srv/knowledge-factory/staging
+sha256sum kf-deploy.bundle.incoming
+git -C /srv/knowledge-factory/app bundle verify \
+  /srv/knowledge-factory/staging/kf-deploy.bundle.incoming
+EOF
 ```
 
-Expected: sha256 совпадает с посчитанной на Mac; `bundle verify` доволен.
+Канонический `knowledge-factory.bundle` пока не трогаем: он станет актуальным
+только после успешного drill'а, в Step A7.
 
-- [ ] **Step A4: Обновить рабочее дерево только fast-forward**
+Expected: sha256 совпадает с посчитанной на Mac.
+
+- [ ] **Step A4: Обновить `main` только fast-forward**
 
 ```bash
 ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
@@ -6070,15 +6090,23 @@ set -euo pipefail
 cd /srv/knowledge-factory/app
 test -z "$(git status --porcelain)"
 git rev-parse HEAD
-git fetch /srv/knowledge-factory/staging/kf-deploy.bundle kf-deploy
+
+git fetch /srv/knowledge-factory/staging/kf-deploy.bundle.incoming kf-main
+git rev-parse FETCH_HEAD
+test "$(git rev-parse FETCH_HEAD)" = 45827a7e3bf6ad3d2cd67e72b7292957ea6b6088
+
+# Существующая история совместима: проверяем это, а не переклонируем.
+git merge-base --is-ancestor 4b31d82a1a9ee5ae174ccd7304114e809dd09aee FETCH_HEAD
+
 git merge --ff-only FETCH_HEAD
-git rev-parse HEAD
+test "$(git rev-parse HEAD)" = 45827a7e3bf6ad3d2cd67e72b7292957ea6b6088
+git log --oneline -3
 EOF
 ```
 
-Expected: HEAD до — `4b31d82a1a9ee5ae174ccd7304114e809dd09aee`, после —
-`45827a7e3bf6ad3d2cd67e72b7292957ea6b6088`. Никакого `reset --hard`: если
-fast-forward невозможен, это повод разбираться, а не перезаписывать сервер.
+Expected: HEAD до — `4b31d82a1a9…`, после — ровно `45827a7e3bf…`. Никакого
+`reset --hard` и никакого повторного `clone`: если fast-forward невозможен,
+это повод разбираться, а не перезаписывать сервер.
 
 - [ ] **Step A5: Проверить, что уязвимость закрыта**
 
@@ -6087,7 +6115,7 @@ ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
 set -euo pipefail
 cd /srv/knowledge-factory/app
 bash -n scripts/restore_drill.sh && echo "bash -n: чисто"
-grep -c 'source "$latest/STATE"' scripts/restore_drill.sh || echo "source удалён: 0 вхождений"
+grep -c 'source "$latest/STATE"' scripts/restore_drill.sh || echo "source удалён"
 latest=$(ls -1dt /srv/knowledge-factory/data/backups/daily-* | head -1)
 echo "свежий бэкап: $latest"
 for key in EXPECTED_DOCUMENTS EXPECTED_CHUNKS EXPECTED_POINTS; do
@@ -6100,7 +6128,7 @@ EOF
 Expected: `bash -n` чист, `source` не найден, парсер печатает три числа
 (сейчас `96/621/621`).
 
-- [ ] **Step A6: Прогнать drill вручную и только потом вернуть таймер**
+- [ ] **Step A6: Прогнать drill вручную и вернуть таймер**
 
 ```bash
 ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
@@ -6110,7 +6138,7 @@ systemctl status knowledge-factory-restore-drill.service --no-pager | tail -20
 EOF
 ```
 
-Expected: сервис завершился успешно и в логе есть `restore_drill_OK`. Таймер
+Expected: сервис завершился успешно, в логе `restore_drill_OK`. Таймер
 возвращается **только после** этого:
 
 ```bash
@@ -6119,7 +6147,45 @@ ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
    systemctl list-timers --no-pager | grep restore-drill'
 ```
 
-- [ ] **Step A7: Установить исправленные скрипты на Mac**
+- [ ] **Step A7: Атомарно обновить канонический bundle**
+
+`origin` рабочего дерева указывает на
+`/srv/knowledge-factory/staging/knowledge-factory.bundle`. Пока файл не
+обновлён, `origin` описывает историю, которой на сервере уже нет.
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+cd /srv/knowledge-factory/staging
+# Одна файловая система, поэтому mv атомарен: origin никогда не увидит
+# наполовину записанный bundle.
+mv -f kf-deploy.bundle.incoming knowledge-factory.bundle
+chmod 600 knowledge-factory.bundle
+git -C /srv/knowledge-factory/app bundle verify knowledge-factory.bundle
+
+# В bundle ссылка называется kf-main — научить origin её видеть.
+git -C /srv/knowledge-factory/app config remote.origin.fetch \
+  '+refs/heads/kf-main:refs/remotes/origin/main'
+git -C /srv/knowledge-factory/app fetch origin
+git -C /srv/knowledge-factory/app rev-parse refs/remotes/origin/main
+EOF
+```
+
+Expected: `origin/main` равен `45827a7e3bf…`, то есть `origin` снова описывает
+то, что действительно развёрнуто.
+
+- [ ] **Step A8: Убрать временную локальную ссылку**
+
+```bash
+cd /Users/romanmizanov/Documents/BD
+git branch -D kf-main
+git branch --list kf-main
+rm -f /tmp/kf-deploy.bundle
+```
+
+Expected: ветки нет. Она существовала только ради имени внутри bundle.
+
+- [ ] **Step A9: Установить исправленные скрипты на Mac**
 
 LaunchAgent запускает копию в `~/.local/share/knowledge-factory/`, а не файл
 репозитория. Обёртка ищет `offsite_lock.py` рядом с собой, поэтому обе части
