@@ -4615,60 +4615,138 @@ git commit -m "feat(backup): pull the off-site copy behind a FileVault gate"
 - Test: `tests/backup/test_restore_drill.py`
 
 **Interfaces:**
-- Consumes: `archive.extract`, `sqlite_snapshot.integrity_check/foreign_key_check/page_count`, `counters.*`, `state.parse_state`, `status.*`, `config.*`.
-- Produces: `DrillError(RuntimeError)`; `drill(backup: Path, *, staleness_hours: int = 48) -> dict` — возвращает сводку `{"sessions": int, "skills": int, "plugins": int, "cron_jobs": int, "unclassified": int}`; `main(argv=None) -> int`.
+- Consumes: `offsite_pull.verify_backup`, `archive.extract`, `sqlite_snapshot.*`, `counters.*`, `inventory.write_inventory`, `hashing.sha256_file`, `config.load_settings`, `status.*`.
+- Produces: `DrillError(RuntimeError)`; `drill(backup: Path, *, staleness_hours: int = …) -> dict`; `main(argv=None) -> int`.
+
+**Обязательные критерии приёмки:**
+
+1. **Никакой собственной проверки сумм.** Используется строгая
+   `offsite_pull.verify_backup()`: пять обычных файлов, полный манифест без
+   дубликатов и посторонних имён, настоящие digest'ы.
+2. **Свежесть — по `CREATED_AT` из `STATE`**, не по `mtime` каталога.
+3. **Сверяется всё, что `STATE` обещает:** `BACKUP_FORMAT_VERSION == 1`,
+   счётчики, `page_count`, `user_version` и SHA-256 обеих БД, а также
+   пересчитанный `INVENTORY.jsonl` — число файлов, суммарные байты и
+   `unclassified`.
+4. **Обязательные объекты — обычные файлы**, а не каталоги и не ссылки.
+5. **Права проверяются у всех секретов:** `auth.json`, `config.yaml`, `.env*`,
+   `sessions/sessions.json`.
+6. **Очистка fail-closed:** успешный drill не возвращает `OK`, если временный
+   каталог с секретами удалить не удалось.
+7. **`load_settings()` внутри обработки ошибок:** битый конфиг даёт
+   `hermes_restore_drill_FAILED`, а не traceback без статуса.
+8. **Контейнер, gateway и Telegram не запускаются нигде.**
 
 - [ ] **Step 1: Написать падающий тест**
 
 ```python
 # tests/backup/test_restore_drill.py
+import json
 import os
+import plistlib
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from hermes_backup.essential_backup import run
+from hermes_backup.hashing import write_sha256sums
 from hermes_backup.restore_drill import DrillError, drill
-from tests.backup.test_essential_backup import _fixture_tree
+from tests.backup.test_essential_backup import _direct_runner, _fixture_tree
+
+REPO = Path(__file__).resolve().parents[2]
+PLIST = REPO / "deploy" / "macos" / "com.hermes.restore-drill.plist"
+WRAPPER = REPO / "deploy" / "macos" / "hermes_restore_drill.sh"
 
 
-def _published(tmp_path):
-    data = _fixture_tree(tmp_path)
-    return run(data, tmp_path / "essential")
+def _published(tmp_path: Path) -> Path:
+    """A real backup, built by the real orchestrator with in-process snapshots."""
+    return run(
+        _fixture_tree(tmp_path),
+        tmp_path / "essential",
+        snapshot_runner=_direct_runner,
+    )
+
+
+def _rewrite(published: Path, mutate) -> Path:
+    """Rebuild a published backup after mutating its extracted tree or STATE.
+
+    Checksums are recomputed, so the result is a *valid* backup that differs
+    only in what the mutation changed — otherwise every test would fail on
+    the manifest instead of on the property under test.
+    """
+    workdir = Path(tempfile.mkdtemp())
+    tree = workdir / "tree"
+    with tarfile.open(published / "essential.tar.gz") as tar:
+        tar.extractall(tree, filter="tar")
+    mutate(tree, published)
+    (published / "essential.tar.gz").unlink()
+    with tarfile.open(published / "essential.tar.gz", "w:gz") as tar:
+        for item in sorted(tree.rglob("*")):
+            tar.add(item, arcname=item.relative_to(tree).as_posix(), recursive=False)
+    (published / "essential.tar.gz").chmod(0o600)
+    write_sha256sums(published)
+    shutil.rmtree(workdir, ignore_errors=True)
+    return published
+
+
+def _set_state(published: Path, key: str, value: str) -> None:
+    lines = (published / "STATE").read_text().splitlines()
+    updated = [f"{key}={value}" if line.startswith(f"{key}=") else line for line in lines]
+    (published / "STATE").write_text("\n".join(updated) + "\n")
+    write_sha256sums(published)
 
 
 def test_healthy_backup_passes_and_reports_counts(tmp_path):
     summary = drill(_published(tmp_path))
-    assert summary == {
-        "sessions": 2,
-        "skills": 1,
-        "plugins": 1,
-        "cron_jobs": 1,
-        "unclassified": summary["unclassified"],
-    }
+    assert summary["sessions"] == 2
+    assert summary["skills"] == 1
+    assert summary["plugins"] == 1
+    assert summary["cron_jobs"] == 1
+    assert summary["unclassified"] >= 0
 
 
 def test_temporary_directory_is_removed(tmp_path, monkeypatch):
     seen = {}
-    real_mkdtemp = __import__("tempfile").mkdtemp
+    real_mkdtemp = tempfile.mkdtemp
 
     def spy(*args, **kwargs):
         seen["path"] = real_mkdtemp(*args, **kwargs)
         return seen["path"]
 
-    monkeypatch.setattr("tempfile.mkdtemp", spy)
+    monkeypatch.setattr(tempfile, "mkdtemp", spy)
     drill(_published(tmp_path))
     assert not Path(seen["path"]).exists()
 
 
-def test_stale_backup_is_rejected(tmp_path):
+def test_a_directory_that_cannot_be_removed_fails_the_drill(tmp_path, monkeypatch):
+    """The temporary tree holds live tokens: leaving it behind is a failure."""
+    import hermes_backup.restore_drill as module
+
+    monkeypatch.setattr(module.shutil, "rmtree", lambda *a, **k: None)
+    with pytest.raises(DrillError, match="cleanup_failed"):
+        drill(_published(tmp_path))
+
+
+def test_stale_created_at_is_rejected(tmp_path):
     published = _published(tmp_path)
-    old = (datetime.now(timezone.utc) - timedelta(hours=72)).timestamp()
-    os.utime(published, (old, old))
+    old = (datetime.now(timezone.utc) - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _set_state(published, "CREATED_AT", old)
+    with pytest.raises(DrillError, match="stale_backup"):
+        drill(published)
+
+
+def test_local_mtime_does_not_make_an_old_backup_look_fresh(tmp_path):
+    published = _published(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _set_state(published, "CREATED_AT", old)
+    os.utime(published, None)  # touched right now
     with pytest.raises(DrillError, match="stale_backup"):
         drill(published)
 
@@ -4676,53 +4754,118 @@ def test_stale_backup_is_rejected(tmp_path):
 def test_checksum_mismatch_is_rejected(tmp_path):
     published = _published(tmp_path)
     (published / "STATE").write_text("BACKUP_FORMAT_VERSION=1\n")
-    with pytest.raises(DrillError, match="checksum"):
+    with pytest.raises(DrillError, match="checksum|manifest|state"):
+        drill(published)
+
+
+def test_an_extra_file_in_the_directory_is_rejected(tmp_path):
+    published = _published(tmp_path)
+    (published / "surprise.txt").write_text("x")
+    with pytest.raises(DrillError, match="unexpected"):
+        drill(published)
+
+
+def test_unknown_backup_format_version_is_rejected(tmp_path):
+    published = _published(tmp_path)
+    _set_state(published, "BACKUP_FORMAT_VERSION", "2")
+    with pytest.raises(DrillError, match="format_version"):
         drill(published)
 
 
 def test_corrupt_database_is_caught(tmp_path):
-    import tarfile
+    def break_db(tree: Path, published: Path) -> None:
+        (tree / "state.db").write_bytes(b"SQLite format 3\x00" + b"\x00" * 200)
 
-    published = _published(tmp_path)
-    workdir = tmp_path / "rewrite"
-    workdir.mkdir()
-    with tarfile.open(published / "essential.tar.gz") as tar:
-        tar.extractall(workdir)
-    (workdir / "state.db").write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
-    with tarfile.open(published / "essential.tar.gz", "w:gz") as tar:
-        for item in sorted(workdir.rglob("*")):
-            tar.add(item, arcname=item.relative_to(workdir).as_posix(), recursive=False)
-    from hermes_backup.hashing import write_sha256sums
+    published = _rewrite(_published(tmp_path), break_db)
+    with pytest.raises(DrillError, match="integrity|sha256"):
+        drill(published)
 
-    write_sha256sums(published)
-    with pytest.raises(DrillError, match="integrity"):
+
+def test_database_sha_mismatch_is_caught(tmp_path):
+    """A readable database that is not the one STATE recorded is a failure."""
+
+    def rewrite_db(tree: Path, published: Path) -> None:
+        connection = sqlite3.connect(tree / "kanban.db")
+        connection.execute("INSERT INTO t (id) VALUES (99)")
+        connection.commit()
+        connection.close()
+
+    published = _rewrite(_published(tmp_path), rewrite_db)
+    with pytest.raises(DrillError, match="KANBAN_DB_SHA256|page_count"):
         drill(published)
 
 
 def test_counter_mismatch_is_caught(tmp_path):
     published = _published(tmp_path)
-    state = (published / "STATE").read_text().replace(
-        "EXPECTED_SKILLS=1", "EXPECTED_SKILLS=99"
-    )
-    (published / "STATE").write_text(state)
-    from hermes_backup.hashing import write_sha256sums
-
-    write_sha256sums(published)
+    _set_state(published, "EXPECTED_SKILLS", "99")
     with pytest.raises(DrillError, match="EXPECTED_SKILLS"):
+        drill(published)
+
+
+def test_inventory_totals_are_recomputed(tmp_path):
+    published = _published(tmp_path)
+    _set_state(published, "ESSENTIAL_FILE_COUNT", "9999")
+    with pytest.raises(DrillError, match="ESSENTIAL_FILE_COUNT"):
         drill(published)
 
 
 def test_zero_cron_jobs_is_valid(tmp_path):
     data = _fixture_tree(tmp_path)
     (data / "cron" / "jobs.json").write_text('{"jobs": []}')
-    published = run(data, tmp_path / "essential")
+    published = run(data, tmp_path / "essential", snapshot_runner=_direct_runner)
     assert drill(published)["cron_jobs"] == 0
 
 
-def test_secret_modes_are_checked(tmp_path):
+def test_a_required_path_that_is_not_a_regular_file_is_rejected(tmp_path):
+    def replace_with_directory(tree: Path, published: Path) -> None:
+        (tree / "auth.json").unlink()
+        (tree / "auth.json").mkdir()
+
+    published = _rewrite(_published(tmp_path), replace_with_directory)
+    with pytest.raises(DrillError, match="not_a_regular_file|missing_required"):
+        drill(published)
+
+
+def test_world_readable_secret_is_rejected(tmp_path):
+    def loosen(tree: Path, published: Path) -> None:
+        (tree / "auth.json").chmod(0o644)
+
+    published = _rewrite(_published(tmp_path), loosen)
+    with pytest.raises(DrillError, match="permissions_too_wide"):
+        drill(published)
+
+
+def test_world_readable_env_file_is_rejected(tmp_path):
+    def loosen(tree: Path, published: Path) -> None:
+        secret = tree / ".env"
+        secret.write_text("TOKEN=x\n")
+        secret.chmod(0o644)
+
+    published = _rewrite(_published(tmp_path), loosen)
+    with pytest.raises(DrillError, match="permissions_too_wide"):
+        drill(published)
+
+
+def test_broken_config_yields_a_failed_status_not_a_traceback(tmp_path):
+    from hermes_backup.restore_drill import main
+
     published = _published(tmp_path)
-    summary = drill(published)
-    assert summary["sessions"] == 2
+    broken = tmp_path / "config.yaml"
+    broken.write_text("backup: [unclosed\n")
+    status_dir = tmp_path / "status"
+
+    code = main(
+        [
+            "--backup", str(published),
+            "--status-dir", str(status_dir),
+            "--config", str(broken),
+        ]
+    )
+
+    assert code == 1
+    from hermes_backup.status import read_status
+
+    assert read_status(status_dir, "restore_drill")["outcome"] == "FAILED"
 
 
 def test_drill_makes_no_network_or_container_calls(tmp_path):
@@ -4732,13 +4875,18 @@ def test_drill_makes_no_network_or_container_calls(tmp_path):
     stub_dir.mkdir()
     for name in ("docker", "ssh", "curl", "rsync"):
         stub = stub_dir / name
-        stub.write_text("#!/bin/sh\necho \"forbidden call: $0\" >&2\nexit 99\n")
+        stub.write_text('#!/bin/sh\necho "forbidden call: $0" >&2\nexit 99\n')
         stub.chmod(0o755)
 
     env = dict(os.environ, PATH=f"{stub_dir}:/usr/bin:/bin")
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = str(REPO)
     result = subprocess.run(
-        [sys.executable, "-m", "hermes_backup.restore_drill", "--backup", str(published)],
+        [
+            sys.executable, "-m", "hermes_backup.restore_drill",
+            "--backup", str(published),
+            "--status-dir", str(tmp_path / "status"),
+            "--config", str(tmp_path / "absent.yaml"),
+        ],
         capture_output=True,
         text=True,
         env=env,
@@ -4746,9 +4894,24 @@ def test_drill_makes_no_network_or_container_calls(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "forbidden call" not in result.stderr
+
+
+def test_drill_runs_on_sunday_morning():
+    data = plistlib.loads(PLIST.read_bytes())
+    assert data["StartCalendarInterval"] == {"Weekday": 0, "Hour": 11, "Minute": 0}
+    assert "EnvironmentVariables" not in data
+    assert "PYTHONPATH" not in PLIST.read_text()
+
+
+def test_wrapper_locates_the_repository_relative_to_itself():
+    text = WRAPPER.read_text()
+    assert "BASH_SOURCE" in text
+    assert 'cd "$REPO"' in text
+    assert ".venv/bin/python" in text
+    assert "HERMES_REPO" not in text
 ```
 
-- [ ] **Step 2: Прогнать тесты и убедиться, что они падают**
+- [ ] **Step 2: Прогнать тест и убедиться, что он падает**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_restore_drill.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'hermes_backup.restore_drill'`
@@ -4768,6 +4931,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import stat
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -4777,7 +4941,7 @@ import yaml
 
 from hermes_backup import config
 from hermes_backup.archive import ArchiveError, extract
-from hermes_backup.config import DEFAULTS, load_settings
+from hermes_backup.config import DEFAULTS, ConfigError, load_settings
 from hermes_backup.counters import (
     CounterError,
     count_cron_jobs,
@@ -4786,62 +4950,125 @@ from hermes_backup.counters import (
     count_skills,
 )
 from hermes_backup.hashing import sha256_file
+from hermes_backup.inventory import write_inventory
+from hermes_backup.offsite_pull import verify_backup
 from hermes_backup.sqlite_snapshot import (
     SnapshotError,
     foreign_key_check,
     integrity_check,
     page_count,
+    user_version,
 )
-from hermes_backup.state import StateError, parse_state
 from hermes_backup.status import status_line, write_status
 
+SUPPORTED_FORMAT = 1
 REQUIRED = ("auth.json", "config.yaml", "state.db", "kanban.db", "cron/jobs.json")
-SECRETS = ("auth.json", "config.yaml")
+SECRETS = ("auth.json", "config.yaml", "sessions/sessions.json")
+DATABASES = {
+    "state.db": ("STATE_DB_SHA256", "STATE_DB_PAGE_COUNT", "STATE_DB_USER_VERSION"),
+    "kanban.db": ("KANBAN_DB_SHA256", "KANBAN_DB_PAGE_COUNT", "KANBAN_DB_USER_VERSION"),
+}
 
 
 class DrillError(RuntimeError):
     """The backup failed a restore check."""
 
 
-def _check_age(backup: Path, staleness_hours: int) -> None:
-    age = datetime.now(timezone.utc).timestamp() - backup.stat().st_mtime
-    if age > staleness_hours * 3600:
-        raise DrillError(f"stale_backup age_hours={age / 3600:.1f}")
+def _check_age(state: dict, staleness_hours: int) -> None:
+    # CREATED_AT, not mtime: mtime says when the copy landed here, so an
+    # old server archive pulled today would look brand new.
+    created = datetime.strptime(str(state["CREATED_AT"]), "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+    if age_hours > staleness_hours:
+        raise DrillError(f"stale_backup age_hours={age_hours:.1f}")
 
 
-def _check_sums(backup: Path) -> None:
-    for line in (backup / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
-        digest, name = line.split("  ", 1)
-        if sha256_file(backup / name) != digest:
-            raise DrillError(f"checksum_mismatch {name}")
+def _require_regular_files(tree: Path) -> None:
+    for name in REQUIRED:
+        path = tree / name
+        if not path.exists():
+            raise DrillError(f"missing_required {name}")
+        if path.is_symlink() or not path.is_file():
+            raise DrillError(f"not_a_regular_file {name}")
+
+
+def _check_databases(tree: Path, state: dict) -> None:
+    for name, (sha_key, pages_key, version_key) in DATABASES.items():
+        path = tree / name
+        try:
+            integrity_check(path)
+            foreign_key_check(path)
+        except SnapshotError as error:
+            raise DrillError(f"integrity {name}: {error}") from error
+        actual_sha = sha256_file(path)
+        if actual_sha != state[sha_key]:
+            raise DrillError(f"{sha_key} mismatch: {actual_sha} != {state[sha_key]}")
+        if page_count(path) != state[pages_key]:
+            raise DrillError(f"{pages_key} expected {state[pages_key]}")
+        if user_version(path) != state[version_key]:
+            raise DrillError(f"{version_key} expected {state[version_key]}")
 
 
 def _check_counts(tree: Path, state: dict) -> dict:
-    counts = {
-        "sessions": count_sessions(tree / "sessions" / "sessions.json"),
-        "skills": count_skills(tree / "skills"),
-        "plugins": count_plugins(tree / "plugins"),
-        "cron_jobs": count_cron_jobs(tree / "cron" / "jobs.json"),
-    }
-    expected = {
-        "sessions": "EXPECTED_SESSIONS",
-        "skills": "EXPECTED_SKILLS",
-        "plugins": "EXPECTED_PLUGINS",
-        "cron_jobs": "EXPECTED_CRON_JOBS",
-    }
-    for key, state_key in expected.items():
+    try:
+        counts = {
+            "sessions": count_sessions(tree / "sessions" / "sessions.json"),
+            "skills": count_skills(tree / "skills"),
+            "plugins": count_plugins(tree / "plugins"),
+            "cron_jobs": count_cron_jobs(tree / "cron" / "jobs.json"),
+        }
+    except CounterError as error:
+        raise DrillError(f"counter {error}") from error
+    for key, state_key in (
+        ("sessions", "EXPECTED_SESSIONS"),
+        ("skills", "EXPECTED_SKILLS"),
+        ("plugins", "EXPECTED_PLUGINS"),
+        ("cron_jobs", "EXPECTED_CRON_JOBS"),
+    ):
         if counts[key] != state[state_key]:
             raise DrillError(f"{state_key} expected {state[state_key]}, found {counts[key]}")
     return counts
 
 
-def drill(backup: Path, *, staleness_hours: int = DEFAULTS["drill_staleness_hours"]) -> dict:
-    _check_age(backup, staleness_hours)
-    _check_sums(backup)
+def _check_inventory(tree: Path, workdir: Path, state: dict) -> None:
+    """Recount the tree: STATE may claim anything, the files decide."""
+    totals = write_inventory(tree, workdir / "inventory-recomputed.jsonl")
+    for actual, state_key in (
+        (totals.files, "ESSENTIAL_FILE_COUNT"),
+        (totals.total_bytes, "ESSENTIAL_TOTAL_BYTES"),
+        (totals.unclassified, "UNCLASSIFIED_FILE_COUNT"),
+    ):
+        if actual != state[state_key]:
+            raise DrillError(f"{state_key} expected {state[state_key]}, found {actual}")
+
+
+def _secret_paths(tree: Path):
+    for name in SECRETS:
+        path = tree / name
+        if path.exists():
+            yield path
+    yield from sorted(tree.glob(".env*"))
+
+
+def _require_private_modes(tree: Path) -> None:
+    for path in _secret_paths(tree):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode & 0o077:
+            raise DrillError(f"permissions_too_wide {path.relative_to(tree)} {mode:o}")
+
+
+def drill(
+    backup: Path, *, staleness_hours: int = DEFAULTS["drill_staleness_hours"]
+) -> dict:
     try:
-        state = parse_state((backup / "STATE").read_text(encoding="utf-8"))
-    except StateError as error:
-        raise DrillError(f"state_invalid {error}") from error
+        state = verify_backup(backup)
+    except RuntimeError as error:
+        raise DrillError(str(error)) from error
+    if int(state["BACKUP_FORMAT_VERSION"]) != SUPPORTED_FORMAT:
+        raise DrillError(f"format_version {state['BACKUP_FORMAT_VERSION']} unsupported")
+    _check_age(state, staleness_hours)
 
     workdir = Path(tempfile.mkdtemp(prefix="hermes-drill-"))
     try:
@@ -4851,42 +5078,28 @@ def drill(backup: Path, *, staleness_hours: int = DEFAULTS["drill_staleness_hour
         except ArchiveError as error:
             raise DrillError(f"archive_unsafe {error}") from error
 
-        for name in REQUIRED:
-            if not (tree / name).exists():
-                raise DrillError(f"missing_required {name}")
+        _require_regular_files(tree)
+        _check_databases(tree, state)
 
-        for name in ("state.db", "kanban.db"):
-            try:
-                integrity_check(tree / name)
-                foreign_key_check(tree / name)
-            except SnapshotError as error:
-                raise DrillError(f"integrity {name}: {error}") from error
-
-        for name, key in (("state.db", "STATE_DB_PAGE_COUNT"), ("kanban.db", "KANBAN_DB_PAGE_COUNT")):
-            actual = page_count(tree / name)
-            if actual != state[key]:
-                raise DrillError(f"{key} expected {state[key]}, found {actual}")
-
-        config_text = (tree / "config.yaml").read_text(encoding="utf-8")
         try:
-            parsed_config = yaml.safe_load(config_text)
+            parsed_config = yaml.safe_load((tree / "config.yaml").read_text(encoding="utf-8"))
         except yaml.YAMLError as error:
             raise DrillError(f"config_unparsable {error}") from error
         if not parsed_config:
             raise DrillError("config_empty")
 
-        try:
-            counts = _check_counts(tree, state)
-        except CounterError as error:
-            raise DrillError(f"counter {error}") from error
-
-        for name in SECRETS:
-            mode = (tree / name).stat().st_mode & 0o777
-            if mode & 0o077:
-                raise DrillError(f"permissions_too_wide {name} {mode:o}")
-    finally:
+        counts = _check_counts(tree, state)
+        _check_inventory(tree, workdir, state)
+        _require_private_modes(tree)
+    except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
+        raise
 
+    # The extracted tree holds live tokens: a drill that cannot remove it
+    # has not finished, however healthy the backup turned out to be.
+    shutil.rmtree(workdir, ignore_errors=True)
+    if workdir.exists():
+        raise DrillError(f"cleanup_failed: {workdir}")
     return {**counts, "unclassified": int(state["UNCLASSIFIED_FILE_COUNT"])}
 
 
@@ -4897,21 +5110,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status-dir", type=Path, default=config.MAC_STATUS_DIR)
     parser.add_argument("--config", type=Path, default=config.MAC_CONFIG)
     args = parser.parse_args(argv)
-    settings = load_settings(args.config)
 
     backup = args.backup
-    if backup is None:
-        candidates = sorted(item for item in args.root.glob("daily-*") if item.is_dir())
-        if not candidates:
-            write_status(args.status_dir, "restore_drill", "FAILED", reason="no_backup")
-            print(status_line("restore_drill", "FAILED", "no_backup"), file=sys.stderr)
-            return 1
-        backup = candidates[-1]
-
     try:
+        settings = load_settings(args.config)
+        if backup is None:
+            candidates = sorted(item for item in args.root.glob("daily-*") if item.is_dir())
+            if not candidates:
+                raise DrillError("no_backup")
+            backup = candidates[-1]
         summary = drill(backup, staleness_hours=settings.drill_staleness_hours)
-    except (DrillError, OSError) as error:
-        write_status(args.status_dir, "restore_drill", "FAILED", reason=str(error), backup_path=str(backup))
+    except (DrillError, ConfigError, OSError) as error:
+        write_status(
+            args.status_dir,
+            "restore_drill",
+            "FAILED",
+            reason=str(error),
+            backup_path=str(backup) if backup else "",
+        )
         print(status_line("restore_drill", "FAILED", str(error)), file=sys.stderr)
         return 1
     write_status(args.status_dir, "restore_drill", "OK", backup_path=str(backup))
@@ -4933,15 +5149,19 @@ if __name__ == "__main__":
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_restore_drill.py -v`
-Expected: PASS, 9 тестов.
+Expected: PASS, 20 тестов.
 
 - [ ] **Step 5: Написать обёртку и LaunchAgent**
 
 ```bash
 # deploy/macos/hermes_restore_drill.sh
 #!/usr/bin/env bash
+# The repository root is derived from this file's own location: a path in
+# a plist's environment goes stale the moment the checkout moves.
 set -euo pipefail
-REPO="${HERMES_REPO:-/Users/romanmizanov/Documents/Hermes}"
+umask 0077
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO"
 exec "$REPO/.venv/bin/python" -m hermes_backup.restore_drill "$@"
 ```
 
@@ -4959,11 +5179,6 @@ exec "$REPO/.venv/bin/python" -m hermes_backup.restore_drill "$@"
     <string>/bin/bash</string>
     <string>/Users/romanmizanov/Documents/Hermes/deploy/macos/hermes_restore_drill.sh</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PYTHONPATH</key>
-    <string>/Users/romanmizanov/Documents/Hermes</string>
-  </dict>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Weekday</key><integer>0</integer>
@@ -4978,24 +5193,7 @@ exec "$REPO/.venv/bin/python" -m hermes_backup.restore_drill "$@"
 </plist>
 ```
 
-- [ ] **Step 6: Проверить plist тестом**
-
-```python
-# добавить в tests/backup/test_restore_drill.py
-import plistlib
-
-DRILL_PLIST = Path(__file__).resolve().parents[2] / "deploy" / "macos" / "com.hermes.restore-drill.plist"
-
-
-def test_drill_runs_on_sunday_morning():
-    data = plistlib.loads(DRILL_PLIST.read_bytes())
-    assert data["StartCalendarInterval"] == {"Weekday": 0, "Hour": 11, "Minute": 0}
-```
-
-Run: `.venv/bin/python -m pytest tests/backup/test_restore_drill.py -v`
-Expected: PASS, 10 тестов.
-
-- [ ] **Step 7: Коммит**
+- [ ] **Step 6: Коммит**
 
 ```bash
 chmod +x deploy/macos/hermes_restore_drill.sh
@@ -5003,6 +5201,7 @@ git add hermes_backup/restore_drill.py deploy/macos/hermes_restore_drill.sh \
         deploy/macos/com.hermes.restore-drill.plist tests/backup/test_restore_drill.py
 git commit -m "feat(backup): drill the pulled copy without starting Hermes"
 ```
+
 
 ---
 
