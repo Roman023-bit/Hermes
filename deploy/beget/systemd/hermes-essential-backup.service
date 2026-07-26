@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes essential off-site backup
+After=docker.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/srv/hermes/app/deploy/beget/hermes_essential_backup.sh
+SuccessExitStatus=75

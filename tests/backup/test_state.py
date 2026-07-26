@@ -22,6 +22,7 @@ VALID = {
     "ESSENTIAL_FILE_COUNT": 900,
     "ESSENTIAL_TOTAL_BYTES": 152000000,
     "UNCLASSIFIED_FILE_COUNT": 0,
+    "EXCLUDED_SPECIAL_COUNT": 0,
 }
 
 
@@ -57,3 +58,20 @@ def test_missing_required_key_is_rejected():
 def test_duplicate_key_is_rejected():
     with pytest.raises(StateError, match="duplicate key"):
         parse_state(format_state(VALID) + "SOURCE_HOST=aeza\n")
+
+
+def test_format_rejects_an_unsafe_string_value():
+    hostile = dict(VALID, HERMES_IMAGE_REF="hermes:latest\nEXPECTED_SKILLS=0")
+    with pytest.raises(StateError, match="HERMES_IMAGE_REF"):
+        format_state(hostile)
+
+
+def test_format_rejects_a_non_integer_count():
+    with pytest.raises(StateError, match="EXPECTED_SKILLS"):
+        format_state(dict(VALID, EXPECTED_SKILLS="78"))
+
+
+def test_format_rejects_a_number_where_a_string_belongs():
+    """A bare 123 means the caller mixed up keys; coercion would hide it."""
+    with pytest.raises(StateError, match="HERMES_GIT_SHA"):
+        format_state(dict(VALID, HERMES_GIT_SHA=123))

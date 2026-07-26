@@ -1,9 +1,11 @@
+import os
 from pathlib import Path
 
 import pytest
 
 from hermes_backup.staging import (
     UnstableSourceError,
+    changed_paths,
     rsync_command,
     rsync_filter,
     stabilized_copy,
@@ -127,3 +129,34 @@ def test_source_that_keeps_changing_fails_closed(tmp_path, monkeypatch):
 def test_missing_source_is_reported(tmp_path):
     with pytest.raises(UnstableSourceError):
         stabilized_copy(tmp_path / "absent", tmp_path / "staging")
+
+
+def test_informational_output_is_not_mistaken_for_churn():
+    """rsync writes notes to stdout; only itemized lines mean a change."""
+    output = "\n".join([
+        'skipping non-regular file "pipe"',
+        ">f+++++++++ sessions/sessions.json",
+        "*deleting   cache/junk.bin",
+        "cd+++++++++ skills/",
+        "",
+    ])
+    assert changed_paths(output) == [
+        ">f+++++++++ sessions/sessions.json",
+        "*deleting   cache/junk.bin",
+        "cd+++++++++ skills/",
+    ]
+
+
+def test_a_fifo_does_not_make_the_source_look_unstable(tmp_path):
+    """A socket or FIFO would otherwise fail every attempt, forever."""
+    source = tmp_path / "data"
+    source.mkdir()
+    (source / "keep.txt").write_text("payload")
+    os.mkfifo(source / "pipe")
+    staging = tmp_path / "staging"
+
+    passes = stabilized_copy(source, staging)
+
+    assert passes >= 1
+    assert (staging / "keep.txt").read_text() == "payload"
+    assert not (staging / "pipe").exists()

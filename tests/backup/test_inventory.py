@@ -1,4 +1,5 @@
 import json
+import os
 
 from hermes_backup.inventory import (
     classify,
@@ -117,10 +118,10 @@ def test_excluded_symlink_lands_in_exclusions_with_its_target(tmp_path):
     (source / ".npm" / "_npx" / "bin" / "mcp-proxy").symlink_to("../lib/proxy.js")
     out = tmp_path / "EXCLUSIONS.jsonl"
 
-    count = write_exclusions(source, out)
+    totals = write_exclusions(source, out)
 
     row = json.loads(out.read_text().splitlines()[0])
-    assert count == 1
+    assert totals.files == 1
     assert row["type"] == "symlink"
     assert row["target"] == "../lib/proxy.js"
     assert row["rule"] == ".npm/*"
@@ -148,10 +149,10 @@ def test_exclusions_are_taken_from_the_source_tree(tmp_path):
     (source / "sessions" / "sessions.json").write_text("{}")
     out = tmp_path / "EXCLUSIONS.jsonl"
 
-    count = write_exclusions(source, out)
+    totals = write_exclusions(source, out)
 
     rows = [json.loads(line) for line in out.read_text().splitlines()]
-    assert count == 1
+    assert totals.files == 1
     assert rows[0]["path"] == "cache/big.bin"
     assert rows[0]["classification"] == "excluded-recoverable"
     assert rows[0]["size"] == 10
@@ -179,3 +180,32 @@ def test_inventory_and_exclusions_do_not_overlap(tmp_path):
         for line in (tmp_path / "INVENTORY.jsonl").read_text().splitlines()
     }
     assert excluded & included == set()
+
+
+def test_fifo_is_recorded_as_special_and_never_opened(tmp_path):
+    source = tmp_path / "data"
+    source.mkdir()
+    os.mkfifo(source / "pipe")
+    out = tmp_path / "EXCLUSIONS.jsonl"
+
+    totals = write_exclusions(source, out)
+
+    row = json.loads(out.read_text().splitlines()[0])
+    assert totals.specials == 1
+    assert row["type"] == "special"
+    assert row["classification"] == "excluded-special"
+    assert "sha256" not in row and "size" not in row
+
+
+def test_inventory_does_not_hash_a_special(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    os.mkfifo(staging / "pipe")
+    out = tmp_path / "INVENTORY.jsonl"
+
+    totals = write_inventory(staging, out)
+
+    row = json.loads(out.read_text().splitlines()[0])
+    assert row["type"] == "special"
+    assert "sha256" not in row
+    assert totals.files == 1

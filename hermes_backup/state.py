@@ -22,6 +22,7 @@ INT_KEYS = frozenset({
     "ESSENTIAL_FILE_COUNT",
     "ESSENTIAL_TOTAL_BYTES",
     "UNCLASSIFIED_FILE_COUNT",
+    "EXCLUDED_SPECIAL_COUNT",
 })
 STR_KEYS = frozenset({
     "CREATED_AT",
@@ -47,6 +48,17 @@ def format_state(values: Mapping[str, int | str]) -> str:
     unknown = set(values) - ALL_KEYS
     if unknown:
         raise StateError(f"unknown key: {sorted(unknown)[0]}")
+    for key in sorted(STR_KEYS):
+        # Values arrive from `docker inspect` and `git`: reject a bad one
+        # where it is produced, not three steps later in the self-check.
+        # str() is deliberately not applied — a number here means the
+        # caller mixed up its keys, and coercion would hide that.
+        value = values[key]
+        if not isinstance(value, str) or not _SAFE_STR.match(value):
+            raise StateError(f"{key} has an unsafe value")
+    for key in sorted(INT_KEYS):
+        if isinstance(values[key], bool) or not isinstance(values[key], int):
+            raise StateError(f"{key} expects an integer")
     return "".join(f"{key}={values[key]}\n" for key in sorted(values))
 
 

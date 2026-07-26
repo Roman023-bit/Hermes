@@ -7,10 +7,18 @@ while anything moved, and fail closed rather than publish a torn file.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 from hermes_backup.inventory import EXCLUDE_RULES
+
+# An itemized line is eleven flag characters and a path: the first says how
+# the entry changed, the second what kind of entry it is. rsync also writes
+# notes like `skipping non-regular file "pipe"` to stdout, and counting those
+# as churn would fail every single attempt for as long as a FIFO exists —
+# and no retry can ever clear it.
+_ITEMIZED = re.compile(r"\A(\*deleting|[<>ch.][fdLDS])")
 
 # -rlptgoH is -a without -D: ownership and hardlinks are preserved, while
 # device nodes and FIFOs are left behind — hashing a FIFO would hang the
@@ -76,6 +84,11 @@ def _run_rsync(source: Path, staging: Path, dry_run: bool, rsync: str) -> str:
     return result.stdout
 
 
+def changed_paths(output: str) -> list[str]:
+    """Itemized changes only, dropping rsync's informational chatter."""
+    return [line for line in output.splitlines() if _ITEMIZED.match(line)]
+
+
 def stabilized_copy(
     source: Path, staging: Path, attempts: int = 4, rsync: str = "rsync"
 ) -> int:
@@ -86,11 +99,7 @@ def stabilized_copy(
     for attempt in range(1, attempts + 1):
         try:
             _run_rsync(source, staging, False, rsync)
-            changed = [
-                line
-                for line in _run_rsync(source, staging, True, rsync).splitlines()
-                if line.strip()
-            ]
+            changed = changed_paths(_run_rsync(source, staging, True, rsync))
         except VanishedFiles:
             # The tree moved under us: that is exactly what the retry is for.
             continue

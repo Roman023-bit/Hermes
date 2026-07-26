@@ -11,6 +11,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +63,22 @@ class InventoryTotals:
     unclassified: int
 
 
+@dataclass(frozen=True)
+class ExclusionTotals:
+    files: int
+    specials: int
+
+
+def _kind(path: Path) -> str:
+    """Classify by lstat alone: opening a FIFO would block forever."""
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "special"
+
+
 def _matches(rel: str, rules: tuple[str, ...]) -> str | None:
     for rule in rules:
         if fnmatch.fnmatch(rel, rule) or fnmatch.fnmatch(rel, f"{rule}/*"):
@@ -100,7 +117,8 @@ def _entries(root: Path):
 
 
 def _describe(path: Path, rel: str, classification: str) -> dict:
-    if path.is_symlink():
+    kind = _kind(path)
+    if kind == "symlink":
         # readlink, never resolve: the target may be absent, external, or a
         # directory, and none of those may be followed or hashed.
         return {
@@ -109,6 +127,9 @@ def _describe(path: Path, rel: str, classification: str) -> dict:
             "target": os.readlink(path),
             "classification": classification,
         }
+    if kind == "special":
+        # No size, no SHA: reading a FIFO or a device would never return.
+        return {"path": rel, "type": "special", "classification": classification}
     return {
         "path": rel,
         "type": "file",
@@ -134,15 +155,29 @@ def write_inventory(staging: Path, out: Path) -> InventoryTotals:
     )
 
 
-def write_exclusions(source: Path, out: Path) -> int:
-    """Record what the exclusion rules removed, read from the live tree."""
-    count = 0
+def write_exclusions(source: Path, out: Path) -> ExclusionTotals:
+    """Record what never reached the archive, read from the live tree.
+
+    Specials are recorded whether or not a rule matches them: rsync leaves
+    them behind by design, and an unrecorded loss is exactly what this
+    backup must not produce.
+    """
+    files = specials = 0
     with out.open("w", encoding="utf-8") as handle:
         for path, rel in _entries(source):
+            kind = _kind(path)
             rule = excluded_by(rel)
-            if rule is None:
+            if kind == "special":
+                record = {
+                    "path": rel,
+                    "rule": rule or "special-object",
+                    "type": "special",
+                    "classification": "excluded-special",
+                }
+                specials += 1
+            elif rule is None:
                 continue
-            if path.is_symlink():
+            elif kind == "symlink":
                 record = {
                     "path": rel,
                     "rule": rule,
@@ -150,6 +185,7 @@ def write_exclusions(source: Path, out: Path) -> int:
                     "target": os.readlink(path),
                     "classification": "excluded-recoverable",
                 }
+                files += 1
             else:
                 # No SHA here: exclusions describe what was left behind, and
                 # hashing the recoverable bulk is the expensive half.
@@ -160,7 +196,7 @@ def write_exclusions(source: Path, out: Path) -> int:
                     "size": path.stat().st_size,
                     "classification": "excluded-recoverable",
                 }
+                files += 1
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            count += 1
     out.chmod(0o600)
-    return count
+    return ExclusionTotals(files=files, specials=specials)
