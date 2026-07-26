@@ -5999,41 +5999,188 @@ git commit -m "fix(offsite): gate the pull on FileVault and share the network lo
 ### Task 18: Развёртывание и первая живая проверка
 
 Выполняется только после Task 1 (`fdesetup isactive` = `true`) и зелёного
-прогона всех тестов в обоих репозиториях.
+прогона обоих наборов тестов.
 
-**Files:**
-- Modify: `MIGRATION_KNOWLEDGE_FACTORY_TO_AEZA.md` (раздел про бэкапы Hermes)
-- Create: `deploy/beget/README.md` — секция «Hermes survivability»
+**Топология развёртывания — проверена 2026-07-27, не такая, как считалось:**
 
-**Interfaces:**
-- Consumes: всё предыдущее.
-- Produces: работающие таймеры на Aeza, работающие агенты на Mac, первая проверенная off-site копия.
+- `~/Documents/BD` — это git-репозиторий, а `knowledge-factory` — обычный
+  подкаталог в нём. Отдельного репозитория у Knowledge Factory нет, remote тоже
+  нет.
+- На Aeza `/srv/knowledge-factory/app` — клон **bundle'а**, а его история
+  получена `git subtree split --prefix=knowledge-factory`. Поэтому хеши на
+  сервере отличаются от локальных, хотя сообщения совпадают.
+- Проверено воспроизведением: `split(8260272)` = `4b31d82a1a9…` — ровно текущий
+  HEAD Aeza; `split(198a760)` = `45827a7e3bf6ad3d2cd67e72b7292957ea6b6088`, и он
+  потомок серверного HEAD, значит `merge --ff-only` пройдёт.
+- `/srv/hermes/app` — обычный клон GitHub, обновляется `fetch` + `merge --ff-only`.
 
-- [ ] **Step 1: Прогнать полный набор тестов Hermes**
+Порядок фаз важен: фаза A закрывает активную уязвимость и идёт первой.
 
-Run: `.venv/bin/python -m pytest tests/backup -v`
-Expected: PASS, все тесты Task 2–15.
+#### Фаза A. Срочная выкатка Knowledge Factory
 
-- [ ] **Step 2: Выкатить код на сервер**
+На Aeza до сих пор `restore_drill.sh` делает `source` файла из каталога
+бэкапов, и делает это от root по таймеру.
+
+- [ ] **Step A1: Собрать bundle из subtree split**
+
+```bash
+set -euo pipefail
+cd /Users/romanmizanov/Documents/BD
+test -z "$(git status --porcelain)"
+SPLIT="$(git subtree split --prefix=knowledge-factory HEAD)"
+echo "split: $SPLIT"
+git branch -f kf-deploy "$SPLIT"
+rm -f /tmp/kf-deploy.bundle
+git bundle create /tmp/kf-deploy.bundle kf-deploy
+git bundle verify /tmp/kf-deploy.bundle
+shasum -a 256 /tmp/kf-deploy.bundle
+```
+
+- [ ] **Step A2: Остановить таймер и убедиться, что drill не выполняется**
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+systemctl stop knowledge-factory-restore-drill.timer
+systemctl is-active knowledge-factory-restore-drill.timer || true
+systemctl is-active knowledge-factory-restore-drill.service || true
+EOF
+```
+
+Expected: таймер `inactive`, сервис `inactive`. Если сервис `active` —
+дождаться завершения, а не обновлять код под работающим drill'ом.
+
+- [ ] **Step A3: Передать и проверить bundle**
+
+```bash
+scp -i ~/.ssh/aeza_hermes /tmp/kf-deploy.bundle \
+  root@138.124.108.97:/srv/knowledge-factory/staging/
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
+  'sha256sum /srv/knowledge-factory/staging/kf-deploy.bundle; \
+   git -C /srv/knowledge-factory/app bundle verify /srv/knowledge-factory/staging/kf-deploy.bundle'
+```
+
+Expected: sha256 совпадает с посчитанной на Mac; `bundle verify` доволен.
+
+- [ ] **Step A4: Обновить рабочее дерево только fast-forward**
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+cd /srv/knowledge-factory/app
+test -z "$(git status --porcelain)"
+git rev-parse HEAD
+git fetch /srv/knowledge-factory/staging/kf-deploy.bundle kf-deploy
+git merge --ff-only FETCH_HEAD
+git rev-parse HEAD
+EOF
+```
+
+Expected: HEAD до — `4b31d82a1a9ee5ae174ccd7304114e809dd09aee`, после —
+`45827a7e3bf6ad3d2cd67e72b7292957ea6b6088`. Никакого `reset --hard`: если
+fast-forward невозможен, это повод разбираться, а не перезаписывать сервер.
+
+- [ ] **Step A5: Проверить, что уязвимость закрыта**
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+cd /srv/knowledge-factory/app
+bash -n scripts/restore_drill.sh && echo "bash -n: чисто"
+grep -c 'source "$latest/STATE"' scripts/restore_drill.sh || echo "source удалён: 0 вхождений"
+latest=$(ls -1dt /srv/knowledge-factory/data/backups/daily-* | head -1)
+echo "свежий бэкап: $latest"
+for key in EXPECTED_DOCUMENTS EXPECTED_CHUNKS EXPECTED_POINTS; do
+  printf '%s = ' "$key"
+  python3 scripts/state_parser.py --key "$key" "$latest/STATE"
+done
+EOF
+```
+
+Expected: `bash -n` чист, `source` не найден, парсер печатает три числа
+(сейчас `96/621/621`).
+
+- [ ] **Step A6: Прогнать drill вручную и только потом вернуть таймер**
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+systemctl start knowledge-factory-restore-drill.service
+systemctl status knowledge-factory-restore-drill.service --no-pager | tail -20
+EOF
+```
+
+Expected: сервис завершился успешно и в логе есть `restore_drill_OK`. Таймер
+возвращается **только после** этого:
 
 ```bash
 ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
-  'cd /srv/hermes/app && git fetch origin && git reset --hard origin/main && git log --oneline -1'
+  'systemctl start knowledge-factory-restore-drill.timer; \
+   systemctl list-timers --no-pager | grep restore-drill'
 ```
 
-- [ ] **Step 3: Прогнать essential-бэкап вручную**
+- [ ] **Step A7: Установить исправленные скрипты на Mac**
+
+LaunchAgent запускает копию в `~/.local/share/knowledge-factory/`, а не файл
+репозитория. Обёртка ищет `offsite_lock.py` рядом с собой, поэтому обе части
+ставятся в один каталог.
+
+```bash
+set -euo pipefail
+KF=/Users/romanmizanov/Documents/BD/knowledge-factory
+RUNTIME="$HOME/.local/share/knowledge-factory"
+launchctl bootout "gui/$(id -u)/com.knowledge-factory.backup-pull" 2>/dev/null || true
+pgrep -f pull_backups_from_aeza && echo "ВНИМАНИЕ: стягивание ещё идёт" || echo "процессов нет"
+install -m 0755 "$KF/scripts/pull_backups_from_aeza.sh" "$RUNTIME/pull_backups_from_aeza.sh"
+install -m 0755 "$KF/scripts/offsite_lock.py" "$RUNTIME/offsite_lock.py"
+diff -q "$KF/scripts/pull_backups_from_aeza.sh" "$RUNTIME/pull_backups_from_aeza.sh"
+diff -q "$KF/scripts/offsite_lock.py" "$RUNTIME/offsite_lock.py"
+```
+
+Агент вернётся в Step C3, после миграции лока.
+
+#### Фаза B. Выкатка Hermes на Aeza
+
+- [ ] **Step B1: Запушить Hermes**
+
+```bash
+cd /Users/romanmizanov/Documents/Hermes
+git status --short
+git push origin main
+git rev-list --count origin/main..main
+```
+
+Expected: `0` — локально ничего не осталось неотправленным.
+
+- [ ] **Step B2: Обновить сервер fast-forward**
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+cd /srv/hermes/app
+test -z "$(git status --porcelain)"
+git rev-parse --short HEAD
+git fetch origin
+git merge --ff-only origin/main
+git rev-parse --short HEAD
+EOF
+```
+
+Expected: до — `6876f3fa9`, после — HEAD пуша. Если рабочее дерево грязное,
+разобраться, что там изменено вручную, а не затирать.
+
+- [ ] **Step B3: Прогнать essential-бэкап вручную**
 
 ```bash
 ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
   '/srv/hermes/app/deploy/beget/hermes_essential_backup.sh'
 ```
 
-Expected: строка `hermes_essential_backup_OK path=/srv/hermes/backups/essential/daily-<UTC> files=… unclassified=… specials=…`.
+Expected: строка `hermes_essential_backup_OK path=… files=… unclassified=…
+specials=…`. Это первая живая проверка понижения привилегий: в выводе не должно
+быть `Permission denied` и `snapshot_failed`.
 
-Это первая живая проверка понижения привилегий. В выводе не должно быть
-`Permission denied` и `snapshot_failed`: если они есть, дочерний процесс под
-uid Hermes не смог пройти через `partial`, и правки прав не работают.
-Дополнительно убедиться:
+- [ ] **Step B4: Проверить опубликованный каталог и владельцев БД**
 
 ```bash
 ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
@@ -6041,125 +6188,18 @@ set -euo pipefail
 latest=$(ls -1dt /srv/hermes/backups/essential/daily-* | head -1)
 echo "каталог: $latest"
 stat -c "%U:%G %a %n" "$latest"
-ls -1 "$latest" | sort | tr "\n" " "; echo
+ls -1 "$latest" | sort | tr '\n' ' '; echo
 grep -E "EXPECTED_SESSIONS|EXPECTED_SKILLS|EXPECTED_PLUGINS|EXCLUDED_SPECIAL_COUNT" "$latest/STATE"
+echo "--- владельцы живых баз:"
+stat -c "%U:%G %a %n" /srv/hermes/data /srv/hermes/data/state.db* /srv/hermes/data/kanban.db*
 EOF
 ```
 
-Ожидается `root:root 700`, ровно пять файлов и `EXPECTED_SESSIONS=2`,
-`EXPECTED_SKILLS=78`, `EXPECTED_PLUGINS=3`. Ни одного каталога с правами `710`
-после завершения остаться не должно.
+Expected: `root:root 700`, ровно пять файлов, `EXPECTED_SESSIONS=2`,
+`EXPECTED_SKILLS=78`, `EXPECTED_PLUGINS=3`; владельцы живых баз и каталога
+данных — прежние `10000:10000`, ни одной записи с `root`.
 
-- [ ] **Step 4: Установить таймеры**
-
-```bash
-ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
-set -euo pipefail
-install -m 0644 /srv/hermes/app/deploy/beget/systemd/hermes-essential-backup.service /etc/systemd/system/
-install -m 0644 /srv/hermes/app/deploy/beget/systemd/hermes-essential-backup.timer /etc/systemd/system/
-install -m 0644 /srv/hermes/app/deploy/beget/systemd/hermes-full-backup.service /etc/systemd/system/
-install -m 0644 /srv/hermes/app/deploy/beget/systemd/hermes-full-backup.timer /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now hermes-essential-backup.timer hermes-full-backup.timer
-crontab -l | grep -v 'deploy/beget/backup.sh' | crontab -
-systemctl list-timers --no-pager | grep hermes
-EOF
-```
-
-Старая cron-запись в 03:15 снимается: расписание теперь ведут таймеры,
-и только они знают про `SuccessExitStatus=75`.
-
-- [ ] **Step 4a: Одноразовая миграция старого каталога-лока**
-
-Ранние черновики использовали каталог `network.lock`; протокол заменён на
-`fcntl.flock` по обычному файлу. Каталог не содержит данных — только следы
-владельца, — но пока он существует, `os.open` на этом пути падает с `EISDIR`.
-
-```bash
-launchctl list | grep -E "com.hermes.offsite-pull|knowledge-factory.backup-pull" || echo "оба агента выгружены"
-pgrep -fl "pull_backups_from_aeza|hermes_backup.offsite_pull" || echo "процессов стягивания нет"
-
-LOCK="$HOME/Library/Application Support/offsite-sync/network.lock"
-if [ -d "$LOCK" ]; then
-  rm -f "$LOCK/meta.json"
-  rmdir "$LOCK"
-fi
-: >"$LOCK"
-chmod 600 "$LOCK"
-ls -l "$LOCK"
-```
-
-Выполнять только при выгруженных агентах и отсутствии процессов стягивания —
-иначе миграция снимет лок из-под работающего pull'а.
-
-- [ ] **Step 5: Первый pull и drill на Mac**
-
-```bash
-deploy/macos/hermes_pull_offsite.sh
-deploy/macos/hermes_restore_drill.sh
-deploy/macos/hermes_backup_status.sh
-```
-
-Expected: `hermes_offsite_pull_OK`, `hermes_freshness_OK`,
-`hermes_restore_drill_OK sessions=2 skills=78 plugins=3 cron_jobs=<N> unclassified=<N>`.
-Если `unclassified` больше нуля — посмотреть `INVENTORY.jsonl` и решить,
-дополнять ли `ESSENTIAL_RULES`.
-
-- [ ] **Step 5a: Установить исправленные скрипты Knowledge Factory**
-
-LaunchAgent запускает копию в `~/.local/share/knowledge-factory/`, а не файл
-репозитория, поэтому правки Task 16 и 17 без этого шага никуда не доедут.
-Обёртка ищет `offsite_lock.py` рядом с собой, значит обе части ставятся в один
-каталог.
-
-```bash
-KF=/Users/romanmizanov/Documents/BD/knowledge-factory
-RUNTIME=~/.local/share/knowledge-factory
-launchctl bootout gui/$(id -u)/com.knowledge-factory.backup-pull 2>/dev/null || true
-install -m 0755 "$KF/scripts/pull_backups_from_aeza.sh" "$RUNTIME/pull_backups_from_aeza.sh"
-install -m 0755 "$KF/scripts/offsite_lock.py" "$RUNTIME/offsite_lock.py"
-diff -q "$KF/scripts/pull_backups_from_aeza.sh" "$RUNTIME/pull_backups_from_aeza.sh"
-diff -q "$KF/scripts/offsite_lock.py" "$RUNTIME/offsite_lock.py"
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.knowledge-factory.backup-pull.plist
-launchctl list | grep knowledge-factory.backup-pull
-```
-
-Исправленный `restore_drill.sh` и `state_parser.py` живут на Aeza в
-`/srv/knowledge-factory/app` — они приедут туда обычным `git pull` в Step 2,
-если репозиторий KF на сервере отслеживает ту же ветку; проверить:
-
-```bash
-ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
-  'grep -c "source \"\$latest/STATE\"" /srv/knowledge-factory/app/scripts/restore_drill.sh || true'
-```
-
-Expected: `0`. Пока там `1`, еженедельный drill исполняет содержимое файла из
-каталога бэкапов от root.
-
-- [ ] **Step 6: Установить агенты**
-
-```bash
-cp deploy/macos/com.hermes.offsite-pull.plist ~/Library/LaunchAgents/
-cp deploy/macos/com.hermes.restore-drill.plist ~/Library/LaunchAgents/
-mkdir -p ~/Library/Logs/hermes-backup
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hermes.offsite-pull.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hermes.restore-drill.plist
-launchctl list | grep com.hermes
-```
-
-- [ ] **Step 7a: Проверить, что снимок не сменил владельцев боевых БД**
-
-```bash
-ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
-  'stat -c "%U:%G %n" /srv/hermes/data /srv/hermes/data/state.db* /srv/hermes/data/kanban.db*'
-```
-
-Expected: у всех строк один и тот же владелец (сейчас `10000:10000`), ни одной
-записи с `root`. Если после первого прогона essential-бэкапа здесь появился
-root-овый `-wal` или `-shm` — понижение привилегий не сработало, и Hermes
-потеряет запись в свою базу.
-
-- [ ] **Step 7: Прогнать полный архив вручную и проверить его**
+- [ ] **Step B5: Прогнать полный архив и проверить его состав**
 
 ```bash
 ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
@@ -6167,26 +6207,105 @@ set -euo pipefail
 /srv/hermes/app/deploy/beget/backup.sh
 latest=$(ls -1t /srv/hermes/backups/hermes-*.tar.gz | head -1)
 echo "архив: $latest"
-echo "--- базы в архиве:"
-tar -tzf "$latest" | grep -E "state\.db|kanban\.db" || true
-echo "--- владельцы живых баз после снимка:"
-stat -c "%U:%G %a %n" /srv/hermes/data /srv/hermes/data/state.db* /srv/hermes/data/kanban.db*
+tar -tzf "$latest" | grep -E '(^|/)(state|kanban)\.db' || true
+stat -c "%U:%G %a %n" /srv/hermes/data/state.db* /srv/hermes/data/kanban.db*
 EOF
 ```
 
-Expected: строка `hermes_full_backup_OK`; в архиве ровно два снимка
-(`./state.db` и `./kanban.db`) и ни одного `-wal`/`-shm`; владельцы живых баз и
-каталога данных — те же, что до прогона (сейчас `10000:10000`), ни одной записи
-с `root`. Появление root-овых sidecar-файлов означает, что `setpriv` не
-сработал и Hermes потеряет запись в свою БД.
+Expected: `hermes_full_backup_OK`; в архиве ровно `state.db` и `kanban.db` без
+`-wal`/`-shm`; владельцы живых баз не изменились.
 
-- [ ] **Step 8: Обновить документацию и закоммитить**
+- [ ] **Step B6: Установить таймеры и снять старый cron**
 
 ```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+for unit in hermes-essential-backup hermes-full-backup; do
+  install -m 0644 "/srv/hermes/app/deploy/beget/systemd/$unit.service" /etc/systemd/system/
+  install -m 0644 "/srv/hermes/app/deploy/beget/systemd/$unit.timer" /etc/systemd/system/
+done
+systemctl daemon-reload
+systemctl enable --now hermes-essential-backup.timer hermes-full-backup.timer
+
+# Снять старую cron-запись, не падая, если crontab пуст или отсутствует.
+current="$(crontab -l 2>/dev/null || true)"
+if printf '%s\n' "$current" | grep -q 'deploy/beget/backup.sh'; then
+  printf '%s\n' "$current" | grep -v 'deploy/beget/backup.sh' | crontab -
+  echo "cron-запись снята"
+else
+  echo "cron-записи не было"
+fi
+crontab -l 2>/dev/null || echo "crontab пуст"
+systemctl list-timers --no-pager | grep hermes
+EOF
+```
+
+Расписание теперь ведут таймеры, и только они знают про `SuccessExitStatus=75`.
+
+#### Фаза C. Mac: лок, первый pull, drill, агенты
+
+- [ ] **Step C1: Мигрировать старый каталог-лок**
+
+Ранние черновики использовали каталог `network.lock`; протокол заменён на
+`fcntl.flock` по обычному файлу, и `os.open` на каталоге падает с `EISDIR`.
+
+```bash
+set -euo pipefail
+launchctl bootout "gui/$(id -u)/com.knowledge-factory.backup-pull" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.hermes.offsite-pull" 2>/dev/null || true
+launchctl list | grep -E "knowledge-factory.backup-pull|com.hermes.offsite-pull" \
+  && echo "ВНИМАНИЕ: агент ещё загружен" || echo "оба агента выгружены"
+pgrep -f "pull_backups_from_aeza|hermes_backup.offsite_pull" \
+  && echo "ВНИМАНИЕ: стягивание идёт" || echo "процессов стягивания нет"
+
+LOCK="$HOME/Library/Application Support/offsite-sync/network.lock"
+mkdir -p "$(dirname "$LOCK")"
+if [ -d "$LOCK" ]; then
+  rm -f "$LOCK/meta.json"
+  rmdir "$LOCK"
+fi
+[ -e "$LOCK" ] || : >"$LOCK"
+chmod 600 "$LOCK"
+ls -l "$LOCK"
+```
+
+- [ ] **Step C2: Первый pull, drill и сводка**
+
+```bash
+cd /Users/romanmizanov/Documents/Hermes
+deploy/macos/hermes_pull_offsite.sh
+deploy/macos/hermes_restore_drill.sh
+deploy/macos/hermes_backup_status.sh
+```
+
+Expected: `hermes_offsite_pull_OK`, `hermes_freshness_OK`,
+`hermes_restore_drill_OK sessions=2 skills=78 plugins=3 cron_jobs=… unclassified=…`.
+Если `unclassified` больше нуля — посмотреть `INVENTORY.jsonl` и решить,
+дополнять ли `ESSENTIAL_RULES`. Стягивание идёт по узкому каналу и может занять
+десятки минут.
+
+- [ ] **Step C3: Установить и вернуть агенты**
+
+```bash
+set -euo pipefail
+mkdir -p ~/Library/Logs/hermes-backup
+cp /Users/romanmizanov/Documents/Hermes/deploy/macos/com.hermes.offsite-pull.plist ~/Library/LaunchAgents/
+cp /Users/romanmizanov/Documents/Hermes/deploy/macos/com.hermes.restore-drill.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.hermes.offsite-pull.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.hermes.restore-drill.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.knowledge-factory.backup-pull.plist
+launchctl list | grep -E "com.hermes|knowledge-factory"
+```
+
+- [ ] **Step C4: Обновить документацию и закоммитить**
+
+```bash
+cd /Users/romanmizanov/Documents/Hermes
 git add MIGRATION_KNOWLEDGE_FACTORY_TO_AEZA.md deploy/beget/README.md
 git commit -m "docs(backup): document the Hermes survivability runbook"
 git push origin main
 ```
+
 
 ---
 
