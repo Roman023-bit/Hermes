@@ -2781,57 +2781,50 @@ def test_split_ownership_fails_closed(tmp_path, monkeypatch):
         require_single_owner([first, second])
 
 
-def test_snapshot_child_can_traverse_the_partial_directory(tmp_path, monkeypatch):
-    """A 0700 root:root parent would deny the unprivileged child."""
-    import stat as stat_module
-
-    import hermes_backup.essential_backup as module
-
-    chowns: list[tuple[str, int, int]] = []
-    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(
-        module.os,
-        "chown",
-        lambda path, uid, gid: chowns.append((Path(path).name, uid, gid)),
-    )
-    seen: dict[str, int] = {}
+def test_snapshots_live_outside_the_root_only_backup_tree(tmp_path):
+    """/srv/hermes/backups is 0700 root:root, so a snapshot directory
+    inside it is unreachable for the unprivileged child no matter what
+    permissions the leaf carries."""
+    seen: dict[str, Path] = {}
 
     def spy_runner(uid, gid, data, dest, names):
-        seen["partial"] = stat_module.S_IMODE(dest.parent.stat().st_mode)
-        seen["snapshots"] = stat_module.S_IMODE(dest.stat().st_mode)
+        seen["dest"] = Path(dest)
         _direct_runner(uid, gid, data, dest, names)
 
-    published = _run(
-        _fixture_tree(tmp_path), tmp_path / "essential", snapshot_runner=spy_runner
-    )
+    root = tmp_path / "essential"
+    published = _run(_fixture_tree(tmp_path), root, snapshot_runner=spy_runner)
 
-    assert seen["partial"] == 0o710
-    assert seen["snapshots"] == 0o700
-    assert any(name.startswith(".daily-") for name, _, _ in chowns)
-    # The traversal grant must not survive the snapshot step.
+    assert root not in seen["dest"].parents
+    assert seen["dest"].name.startswith("hermes-essential-snapshots-")
     assert published.stat().st_mode & 0o777 == 0o700
 
 
-def test_traversal_is_revoked_even_when_the_snapshot_fails(tmp_path, monkeypatch):
-    import hermes_backup.essential_backup as module
+def test_snapshot_directory_is_private_and_removed(tmp_path):
+    seen: dict[str, Path] = {}
 
-    revoked: list[str] = []
-    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(module.os, "chown", lambda *args: None)
-    real_revoke = module._revoke_traversal
-    monkeypatch.setattr(
-        module,
-        "_revoke_traversal",
-        lambda partial: (revoked.append(partial.name), real_revoke(partial))[1],
-    )
+    def spy_runner(uid, gid, data, dest, names):
+        seen["dest"] = Path(dest)
+        seen["mode"] = stat.S_IMODE(Path(dest).stat().st_mode)
+        _direct_runner(uid, gid, data, dest, names)
+
+    _run(_fixture_tree(tmp_path), tmp_path / "essential", snapshot_runner=spy_runner)
+
+    assert seen["mode"] == 0o700
+    # A full copy of both databases must not outlive the run.
+    assert not seen["dest"].exists()
+
+
+def test_snapshot_directory_is_removed_when_the_run_fails(tmp_path):
+    seen: dict[str, Path] = {}
 
     def broken(uid, gid, data, dest, names):
+        seen["dest"] = Path(dest)
         raise RuntimeError("snapshot_failed (1): boom")
 
     with pytest.raises(RuntimeError, match="snapshot_failed"):
         _run(_fixture_tree(tmp_path), tmp_path / "essential", snapshot_runner=broken)
 
-    assert revoked
+    assert not seen["dest"].exists()
 
 
 def test_snapshot_command_drops_privileges_to_the_file_owner():
@@ -2879,6 +2872,8 @@ def test_service_treats_lock_skip_as_success():
     unit = (DEPLOY / "systemd" / "hermes-essential-backup.service").read_text()
     assert "SuccessExitStatus=75" in unit
     assert "UMask=0077" in unit
+    # Snapshots land in /tmp now, so keep that /tmp private to the unit.
+    assert "PrivateTmp=true" in unit
 
 
 def test_wrapper_takes_the_shared_lock():
@@ -2956,6 +2951,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3090,27 +3086,19 @@ def _tree_bytes(root: Path) -> int:
     return total
 
 
-def _grant_traversal(partial: Path, snapshots: Path, uid: int, gid: int) -> None:
-    """Let the unprivileged snapshot child reach its own directory.
+def _make_snapshot_dir(uid: int, gid: int) -> Path:
+    """A directory the unprivileged snapshot child can actually reach.
 
-    The child runs as the Hermes uid, so a 0700 root:root parent would
-    deny it before SQLite is even opened. 0710 with the child's group
-    grants traversal and nothing else: the directory stays unreadable and
-    unlistable, and the grant lasts only while the snapshot runs.
+    It cannot live inside the backup root: /srv/hermes/backups and its
+    essential/ subdirectory are 0700 root:root, so no permission granted
+    on the leaf would help — the path above it is already closed. Opening
+    those directories up would widen far more than the snapshot needs.
     """
-    if os.geteuid() != 0:
-        return
-    os.chown(snapshots, uid, gid)
+    snapshots = Path(tempfile.mkdtemp(prefix="hermes-essential-snapshots-"))
     snapshots.chmod(0o700)
-    os.chown(partial, 0, gid)
-    partial.chmod(0o710)
-
-
-def _revoke_traversal(partial: Path) -> None:
-    if os.geteuid() != 0:
-        return
-    os.chown(partial, 0, 0)
-    partial.chmod(0o700)
+    if os.geteuid() == 0:
+        os.chown(snapshots, uid, gid)
+    return snapshots
 
 
 def _validate_structured(staging: Path) -> None:
@@ -3159,7 +3147,7 @@ def run(
         )
 
     staging = partial / "staging"
-    snapshots = partial / "snapshots"
+    snapshots: Path | None = None
     if partial.exists():
         shutil.rmtree(partial)
     partial.mkdir(parents=True, mode=0o700)
@@ -3172,14 +3160,8 @@ def run(
             raise RuntimeError("insufficient_disk_space_for_archive")
         _validate_structured(staging)
 
-        snapshots.mkdir(mode=0o700)
-        _grant_traversal(partial, snapshots, uid, gid)
-        try:
-            runner(uid, gid, data, snapshots, DATABASES)
-        finally:
-            # Give the private directory back even when the child failed:
-            # a group-traversable partial must not outlive the snapshot.
-            _revoke_traversal(partial)
+        snapshots = _make_snapshot_dir(uid, gid)
+        runner(uid, gid, data, snapshots, DATABASES)
         missing = [name for name in DATABASES if not (snapshots / name).exists()]
         if missing:
             raise RuntimeError(f"snapshot_missing: {missing}")
@@ -3198,6 +3180,7 @@ def run(
             }
             shutil.move(str(source), str(staging / name))
         shutil.rmtree(snapshots)
+        snapshots = None
 
         totals = write_inventory(staging, partial / "INVENTORY.jsonl")
         exclusions = write_exclusions(data, partial / "EXCLUSIONS.jsonl")
@@ -3238,6 +3221,11 @@ def run(
     except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
         raise
+    finally:
+        # Snapshots hold a full copy of both databases: never leave them
+        # behind, whichever way this run ended.
+        if snapshots is not None:
+            shutil.rmtree(snapshots, ignore_errors=True)
     _prune(root, settings.retention_server)
     return published
 
@@ -3333,6 +3321,7 @@ After=docker.service
 [Service]
 Type=oneshot
 UMask=0077
+PrivateTmp=true
 ExecStart=/srv/hermes/app/deploy/beget/hermes_essential_backup.sh
 SuccessExitStatus=75
 ```
@@ -3410,9 +3399,8 @@ git commit -m "feat(backup): publish the essential backup atomically on Aeza"
 `setpriv_runner` (публичное имя, его теперь импортирует второй потребитель) и
 оставить псевдоним `_setpriv_runner = setpriv_runner` не нужно — заменить
 единственное использование внутри `run()`. Ничего больше не меняется:
-`database_paths`, `require_single_owner`, `snapshot_command`,
-`_grant_traversal`, `_revoke_traversal` уже публичны или используются только
-внутри модуля.
+`database_paths`, `require_single_owner`, `snapshot_command` и
+`_make_snapshot_dir` уже публичны или используются только внутри модуля.
 
 В `tests/backup/test_essential_backup.py` ничего менять не требуется.
 
