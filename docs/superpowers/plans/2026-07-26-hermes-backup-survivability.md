@@ -1850,6 +1850,96 @@ git commit -m "feat(backup): record run outcomes in status files"
 через `yaml.safe_load`. Архив с пойманным на середине записи `config.yaml` не
 должен публиковаться ни при каких условиях.
 
+**Третий обязательный критерий: снимки снимаются с понижением привилегий.**
+На Aeza `state.db*`, `kanban.db` и каталог данных принадлежат `10000:10000`,
+процесс Hermes держит БД открытой. Root-соединение в момент, когда БД никем не
+открыта, создаст `-wal`/`-shm` с владельцем root; падение процесса между
+открытием и закрытием оставит их на диске, и Hermes потеряет запись в
+собственную базу. Реализовать в `hermes_backup/essential_backup.py`:
+
+```python
+def owner_of(path: Path) -> tuple[int, int]:
+    info = path.stat()
+    return info.st_uid, info.st_gid
+
+
+def require_single_owner(paths: Sequence[Path]) -> tuple[int, int]:
+    """Every database artefact must belong to one owner, or we stop.
+
+    A split owner means someone already ran a backup as the wrong user;
+    chowning a live tree under a running Hermes would be worse.
+    """
+    owners = {path: owner_of(path) for path in paths if path.exists()}
+    distinct = set(owners.values())
+    if len(distinct) != 1:
+        raise RuntimeError(f"owner_mismatch: {owners}")
+    return distinct.pop()
+
+
+def snapshot_command(uid: int, gid: int, data: Path, dest: Path, names: Sequence[str]) -> list[str]:
+    # Drop privileges for this child only: the orchestrator still needs
+    # docker inspect and root-only directories.
+    return [
+        "/usr/bin/setpriv",
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "/usr/bin/python3",
+        "-m",
+        "hermes_backup.snapshot_cli",
+        "--data",
+        str(data),
+        "--dest",
+        str(dest),
+        *names,
+    ]
+```
+
+Порядок в `run()`: собрать список `data/state.db`, `data/state.db-wal`,
+`data/state.db-shm`, `data/kanban.db`, `data` → `require_single_owner` →
+создать каталог снимков и `os.chown` его на этот UID/GID (это наш staging, а не
+живое дерево) → запустить `snapshot_command` через `subprocess.run` с
+`env={"PYTHONPATH": "/srv/hermes/app"}` → **повторно** проверить владельцев
+исходных БД и sidecar-файлов → при несоответствии `RuntimeError`, архив не
+публикуется. Никакого `chown` по живому дереву.
+
+Тесты в `tests/backup/test_essential_backup.py`:
+
+```python
+def test_snapshot_command_drops_privileges_to_the_file_owner():
+    from hermes_backup.essential_backup import snapshot_command
+
+    argv = snapshot_command(10000, 10000, Path("/srv/hermes/data"), Path("/tmp/s"), ["state.db"])
+    assert argv[:4] == ["/usr/bin/setpriv", "--reuid=10000", "--regid=10000", "--clear-groups"]
+    assert "hermes_backup.snapshot_cli" in argv
+    assert argv[-1] == "state.db"
+
+
+def test_split_ownership_fails_closed(tmp_path):
+    from hermes_backup.essential_backup import require_single_owner
+
+    first = tmp_path / "state.db"
+    first.write_text("x")
+    second = tmp_path / "kanban.db"
+    second.write_text("x")
+
+    import hermes_backup.essential_backup as module
+
+    real_owner_of = module.owner_of
+    module.owner_of = lambda path: (0, 0) if path.name == "kanban.db" else real_owner_of(path)
+    try:
+        with pytest.raises(RuntimeError, match="owner_mismatch"):
+            require_single_owner([first, second])
+    finally:
+        module.owner_of = real_owner_of
+```
+
+В тестовом окружении `setpriv` не запускается: тесты Task 11, которые реально
+собирают архив, вызывают `run(..., snapshot_runner=...)` с подставленным
+раннером, который просто вызывает `snapshot()` напрямую. Сигнатура:
+`run(data, root, *, rsync="rsync", repo=None, snapshot_runner=None)`, где
+`None` означает боевой путь через `setpriv`.
+
 **Второй обязательный критерий: закрыть асимметрию `format_state`.** Сейчас
 `parse_state` проверяет строковые значения регуляркой `_SAFE_STR`, а
 `format_state` пишет их без проверки. `HERMES_IMAGE_REF` и `HERMES_GIT_SHA`
@@ -3755,6 +3845,18 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hermes.offsite-pull.
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hermes.restore-drill.plist
 launchctl list | grep com.hermes
 ```
+
+- [ ] **Step 7a: Проверить, что снимок не сменил владельцев боевых БД**
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
+  'stat -c "%U:%G %n" /srv/hermes/data /srv/hermes/data/state.db* /srv/hermes/data/kanban.db*'
+```
+
+Expected: у всех строк один и тот же владелец (сейчас `10000:10000`), ни одной
+записи с `root`. Если после первого прогона essential-бэкапа здесь появился
+root-овый `-wal` или `-shm` — понижение привилегий не сработало, и Hermes
+потеряет запись в свою базу.
 
 - [ ] **Step 7: Проверить, что полный архив больше не содержит живых БД**
 
