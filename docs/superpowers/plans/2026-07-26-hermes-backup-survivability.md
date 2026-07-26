@@ -582,6 +582,14 @@ from hermes_backup.inventory import (
 )
 
 
+def test_dot_prefixed_caches_are_excluded():
+    """`du /srv/hermes/data/*` hid these: .npm and .cache held 150 MB."""
+    assert excluded_by(".npm/_npx/abc/node_modules/x.js")
+    assert excluded_by(".cache/uv/wheels-v6/pypi/tabulate/meta.json")
+    assert excluded_by(".local/share/pki/nssdb/key4.db") is None
+    assert excluded_by(".env") is None
+
+
 def test_recoverable_paths_are_excluded():
     assert excluded_by("cache/model.bin")
     assert excluded_by("cron/output/run-1.log")
@@ -612,10 +620,85 @@ def test_inventory_lists_staging_contents_with_checksums(tmp_path):
     by_path = {row["path"]: row for row in rows}
     assert by_path["sessions/sessions.json"]["classification"] == "essential"
     assert by_path["surprise.bin"]["classification"] == "unclassified"
+    assert by_path["surprise.bin"]["type"] == "file"
     assert len(by_path["surprise.bin"]["sha256"]) == 64
     assert totals.files == 2
     assert totals.total_bytes == 6
     assert totals.unclassified == 1
+
+
+def test_symlink_is_recorded_by_target_not_by_content(tmp_path):
+    staging = tmp_path / "staging"
+    (staging / "skills").mkdir(parents=True)
+    (staging / "skills" / "real.md").write_text("body")
+    (staging / "skills" / "alias.md").symlink_to("real.md")
+    out = tmp_path / "INVENTORY.jsonl"
+
+    totals = write_inventory(staging, out)
+
+    rows = {
+        json.loads(line)["path"]: json.loads(line)
+        for line in out.read_text().splitlines()
+    }
+    alias = rows["skills/alias.md"]
+    assert alias["type"] == "symlink"
+    assert alias["target"] == "real.md"
+    assert "sha256" not in alias
+    assert alias["classification"] == "essential"
+    # The link contributes an entry but no bytes: only "body" is counted.
+    assert totals.files == 2
+    assert totals.total_bytes == 4
+
+
+def test_broken_symlink_is_recorded_and_never_followed(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "dangling").symlink_to("nowhere/at/all")
+    out = tmp_path / "INVENTORY.jsonl"
+
+    totals = write_inventory(staging, out)
+
+    row = json.loads(out.read_text().splitlines()[0])
+    assert row == {
+        "path": "dangling",
+        "type": "symlink",
+        "target": "nowhere/at/all",
+        "classification": "unclassified",
+    }
+    assert totals.files == 1
+
+
+def test_symlinked_directory_is_recorded_but_not_descended(tmp_path):
+    outside = tmp_path / "outside"
+    (outside / "secret").mkdir(parents=True)
+    (outside / "secret" / "leak.txt").write_text("should never be inventoried")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "escape").symlink_to(outside, target_is_directory=True)
+    out = tmp_path / "INVENTORY.jsonl"
+
+    totals = write_inventory(staging, out)
+
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [row["path"] for row in rows] == ["escape"]
+    assert rows[0]["type"] == "symlink"
+    assert totals.files == 1
+
+
+def test_excluded_symlink_lands_in_exclusions_with_its_target(tmp_path):
+    source = tmp_path / "data"
+    (source / ".npm" / "_npx" / "bin").mkdir(parents=True)
+    (source / ".npm" / "_npx" / "bin" / "mcp-proxy").symlink_to("../lib/proxy.js")
+    out = tmp_path / "EXCLUSIONS.jsonl"
+
+    count = write_exclusions(source, out)
+
+    row = json.loads(out.read_text().splitlines()[0])
+    assert count == 1
+    assert row["type"] == "symlink"
+    assert row["target"] == "../lib/proxy.js"
+    assert row["rule"] == ".npm/*"
+    assert "size" not in row
 
 
 def test_paths_with_tabs_and_newlines_survive_round_trip(tmp_path):
@@ -680,7 +763,6 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'hermes_backup.inventor
 - [ ] **Step 3: Реализовать модуль**
 
 ```python
-# hermes_backup/inventory.py
 """What travels in the backup, what does not, and why.
 
 Selection is "everything except the explicit exclusions", so an unknown
@@ -693,6 +775,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -700,6 +783,10 @@ from hermes_backup.hashing import sha256_file
 
 EXCLUDE_RULES: tuple[str, ...] = (
     "cache/*",
+    # Dot-prefixed caches: `du /srv/hermes/data/*` never listed them, so the
+    # first rule set missed 150 MB of npx and uv downloads in .npm and .cache.
+    ".npm/*",
+    ".cache/*",
     "bin/*",
     "image_cache/*",
     "logs/*",
@@ -757,57 +844,88 @@ def classify(rel: str) -> str:
     return "essential" if _matches(rel, ESSENTIAL_RULES) else "unclassified"
 
 
-def _relative_files(root: Path):
-    for path in sorted(root.rglob("*")):
-        if path.is_file() and not path.is_symlink():
+def _entries(root: Path):
+    """Walk the tree without ever following a symlink.
+
+    ``Path.rglob`` descends into symlinked directories, which can leave the
+    tree, loop, or hash something that only looks local. Symlinks are
+    recorded as themselves — dropping them would silently lose state, which
+    is the one thing this backup must never do.
+    """
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        linked_dirs = sorted(name for name in dirnames if (base / name).is_symlink())
+        for name in linked_dirs:
+            path = base / name
             yield path, path.relative_to(root).as_posix()
+        dirnames[:] = sorted(set(dirnames) - set(linked_dirs))
+        for name in sorted(filenames):
+            path = base / name
+            yield path, path.relative_to(root).as_posix()
+
+
+def _describe(path: Path, rel: str, classification: str) -> dict:
+    if path.is_symlink():
+        # readlink, never resolve: the target may be absent, external, or a
+        # directory, and none of those may be followed or hashed.
+        return {
+            "path": rel,
+            "type": "symlink",
+            "target": os.readlink(path),
+            "classification": classification,
+        }
+    return {
+        "path": rel,
+        "type": "file",
+        "size": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "classification": classification,
+    }
 
 
 def write_inventory(staging: Path, out: Path) -> InventoryTotals:
     files = total_bytes = unclassified = 0
     with out.open("w", encoding="utf-8") as handle:
-        for path, rel in _relative_files(staging):
-            size = path.stat().st_size
+        for path, rel in _entries(staging):
             classification = classify(rel)
-            handle.write(
-                json.dumps(
-                    {
-                        "path": rel,
-                        "size": size,
-                        "sha256": sha256_file(path),
-                        "classification": classification,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+            record = _describe(path, rel, classification)
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             files += 1
-            total_bytes += size
+            total_bytes += record.get("size", 0)
             unclassified += classification == "unclassified"
     out.chmod(0o600)
-    return InventoryTotals(files=files, total_bytes=total_bytes, unclassified=unclassified)
+    return InventoryTotals(
+        files=files, total_bytes=total_bytes, unclassified=unclassified
+    )
 
 
 def write_exclusions(source: Path, out: Path) -> int:
     """Record what the exclusion rules removed, read from the live tree."""
     count = 0
     with out.open("w", encoding="utf-8") as handle:
-        for path, rel in _relative_files(source):
+        for path, rel in _entries(source):
             rule = excluded_by(rel)
             if rule is None:
                 continue
-            handle.write(
-                json.dumps(
-                    {
-                        "path": rel,
-                        "rule": rule,
-                        "size": path.stat().st_size,
-                        "classification": "excluded-recoverable",
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+            if path.is_symlink():
+                record = {
+                    "path": rel,
+                    "rule": rule,
+                    "type": "symlink",
+                    "target": os.readlink(path),
+                    "classification": "excluded-recoverable",
+                }
+            else:
+                # No SHA here: exclusions describe what was left behind, and
+                # hashing the recoverable bulk is the expensive half.
+                record = {
+                    "path": rel,
+                    "rule": rule,
+                    "type": "file",
+                    "size": path.stat().st_size,
+                    "classification": "excluded-recoverable",
+                }
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
     out.chmod(0o600)
     return count
@@ -816,7 +934,7 @@ def write_exclusions(source: Path, out: Path) -> int:
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_inventory.py -v`
-Expected: PASS, 6 тестов.
+Expected: PASS, 10 тестов.
 
 - [ ] **Step 5: Коммит**
 
@@ -1061,6 +1179,28 @@ def test_round_trip_preserves_content_and_modes(tmp_path):
     assert (restored / "auth.json").stat().st_mode & 0o777 == 0o600
 
 
+def test_internal_symlink_survives_the_round_trip(tmp_path):
+    """Links inside the tree are legitimate state and must be preserved.
+
+    Task 5 records them in INVENTORY.jsonl without dereferencing; the
+    archive has to carry them as links, not as copies of their target.
+    """
+    staging = tmp_path / "staging"
+    (staging / "skills").mkdir(parents=True)
+    (staging / "skills" / "real.md").write_text("body")
+    (staging / "skills" / "alias.md").symlink_to("real.md")
+    archive = tmp_path / "essential.tar.gz"
+
+    create(staging, archive)
+    validate(archive)
+    restored = tmp_path / "restored"
+    extract(archive, restored)
+
+    alias = restored / "skills" / "alias.md"
+    assert alias.is_symlink()
+    assert os.readlink(alias) == "real.md"
+
+
 def test_absolute_path_is_rejected(tmp_path):
     def mutate(tar):
         info = tarfile.TarInfo("/etc/passwd")
@@ -1205,7 +1345,7 @@ def extract(tar_path: Path, dest: Path) -> None:
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_archive.py -v`
-Expected: PASS, 8 тестов.
+Expected: PASS, 9 тестов.
 
 - [ ] **Step 5: Коммит**
 
