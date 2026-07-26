@@ -90,7 +90,10 @@ def escapes_tree(link: Path, root: Path) -> bool:
     if os.path.isabs(target):
         return True
     resolved = os.path.normpath(os.path.join(link.parent, target))
-    return os.path.relpath(resolved, root).startswith("..")
+    rel = os.path.relpath(resolved, root)
+    # Compare path components, not a string prefix: a directory named
+    # "..cache" starts with ".." while sitting firmly inside the tree.
+    return rel == os.pardir or rel.startswith(os.pardir + os.sep)
 
 
 def _matches(rel: str, rules: tuple[str, ...]) -> str | None:

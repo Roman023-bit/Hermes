@@ -21,6 +21,15 @@ def test_command_preserves_ownership_and_hardlinks():
     assert "-a" not in argv
 
 
+def test_safe_links_is_used_in_both_commands():
+    """A link out of the tree would fail the archive validator later."""
+    for dry_run in (False, True):
+        argv = rsync_command(
+            Path("/srv/hermes/data"), Path("/tmp/staging"), dry_run=dry_run
+        )
+        assert "--safe-links" in argv
+
+
 def test_root_rules_are_anchored_for_rsync():
     assert rsync_filter("cache/*") == "/cache/"
     assert rsync_filter(".npm/*") == "/.npm/"

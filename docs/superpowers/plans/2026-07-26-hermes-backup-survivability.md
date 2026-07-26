@@ -566,7 +566,7 @@ git commit -m "feat(backup): count skills, plugins, sessions and cron jobs by co
 
 **Interfaces:**
 - Consumes: `hermes_backup.hashing.sha256_file`.
-- Produces: `EXCLUDE_RULES: tuple[str, ...]`; `ESSENTIAL_RULES: tuple[str, ...]`; `excluded_by(rel: str) -> str | None`; `classify(rel: str) -> str`; `write_inventory(staging: Path, out: Path) -> InventoryTotals`; `write_exclusions(source: Path, out: Path) -> int`; `@dataclass InventoryTotals(files: int, total_bytes: int, unclassified: int)`.
+- Produces: `EXCLUDE_RULES: tuple[str, ...]`; `ESSENTIAL_RULES: tuple[str, ...]`; `excluded_by(rel: str) -> str | None`; `classify(rel: str) -> str`; `write_inventory(staging: Path, out: Path) -> InventoryTotals`; `write_exclusions(source: Path, out: Path) -> int` (в Task 11 становится `-> ExclusionTotals`); `@dataclass InventoryTotals(files: int, total_bytes: int, unclassified: int)`.
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -1588,7 +1588,17 @@ _ITEMIZED = re.compile(r"\A(\*deleting|[<>ch.][fdLDS])")
 # -rlptgoH is -a without -D: ownership and hardlinks are preserved, while
 # device nodes and FIFOs are left behind — hashing a FIFO would hang the
 # backup instead of failing it.
-RSYNC_FLAGS = ("-rlptgoH", "--numeric-ids", "--delete", "--delete-excluded", "--itemize-changes")
+RSYNC_FLAGS = (
+    "-rlptgoH",
+    "--numeric-ids",
+    # Links pointing outside the tree cannot be archived safely and would
+    # be rejected by the archive validator; leave them behind here and let
+    # write_exclusions record them.
+    "--safe-links",
+    "--delete",
+    "--delete-excluded",
+    "--itemize-changes",
+)
 VANISHED_EXIT = 24
 
 
@@ -2465,6 +2475,23 @@ from dataclasses import dataclass
 class ExclusionTotals:
     files: int
     specials: int
+    escaping: int
+
+
+def escapes_tree(link: Path, root: Path) -> bool:
+    """True when a symlink points outside the tree.
+
+    Judged lexically, never by resolving: the target may not exist, and
+    resolving would follow it out of the tree to answer the question.
+    """
+    target = os.readlink(link)
+    if os.path.isabs(target):
+        return True
+    resolved = os.path.normpath(os.path.join(link.parent, target))
+    rel = os.path.relpath(resolved, root)
+    # Compare path components, not a string prefix: a directory named
+    # "..cache" starts with ".." while sitting firmly inside the tree.
+    return rel == os.pardir or rel.startswith(os.pardir + os.sep)
 
 
 def _kind(path: Path) -> str:
@@ -2491,12 +2518,24 @@ def write_exclusions(source: Path, out: Path) -> ExclusionTotals:
     them behind by design, and an unrecorded loss is exactly what this
     backup must not produce.
     """
-    files = specials = 0
+    files = specials = escaping = 0
     with out.open("w", encoding="utf-8") as handle:
         for path, rel in _entries(source):
             kind = _kind(path)
             rule = excluded_by(rel)
-            if kind == "special":
+            if kind == "symlink" and escapes_tree(path, source):
+                # rsync --safe-links leaves these behind, and the archive
+                # validator would reject one anyway. Record it so a link
+                # that mattered is visible rather than silently gone.
+                record = {
+                    "path": rel,
+                    "rule": rule or "escaping-symlink",
+                    "type": "symlink",
+                    "target": os.readlink(path),
+                    "classification": "excluded-escaping-link",
+                }
+                escaping += 1
+            elif kind == "special":
                 record = {
                     "path": rel,
                     "rule": rule or "special-object",
@@ -2528,7 +2567,7 @@ def write_exclusions(source: Path, out: Path) -> ExclusionTotals:
                 files += 1
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     out.chmod(0o600)
-    return ExclusionTotals(files=files, specials=specials)
+    return ExclusionTotals(files=files, specials=specials, escaping=escaping)
 ```
 
 Тесты в `tests/backup/test_inventory.py` — поправить два существующих на новый

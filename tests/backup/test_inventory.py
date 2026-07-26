@@ -3,6 +3,7 @@ import os
 
 from hermes_backup.inventory import (
     classify,
+    escapes_tree,
     excluded_by,
     write_exclusions,
     write_inventory,
@@ -240,3 +241,15 @@ def test_a_relative_link_climbing_out_of_the_tree_escapes(tmp_path):
     out = tmp_path / "EXCLUSIONS.jsonl"
 
     assert write_exclusions(source, out).escaping == 1
+
+
+def test_a_target_named_like_a_parent_reference_stays_inside(tmp_path):
+    """A directory called "..cache" is inside the tree, prefix or not."""
+    source = tmp_path / "data"
+    (source / "..cache").mkdir(parents=True)
+    (source / "..cache" / "file.txt").write_text("x")
+    (source / "link").symlink_to("..cache/file.txt")
+    out = tmp_path / "EXCLUSIONS.jsonl"
+
+    assert escapes_tree(source / "link", source) is False
+    assert write_exclusions(source, out).escaping == 0
