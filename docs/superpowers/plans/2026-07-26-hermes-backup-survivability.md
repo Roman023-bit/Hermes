@@ -2025,7 +2025,7 @@ def test_backup_section_overrides_defaults(tmp_path):
 
 def test_unknown_key_is_rejected(tmp_path):
     target = tmp_path / "config.yaml"
-    target.write_text("backup:\n  retention_mac: 14\n")
+    target.write_text("backup:\n  retention_mars: 14\n")
     with pytest.raises(ConfigError, match="unknown"):
         load_settings(target)
 
@@ -2320,7 +2320,7 @@ def read_status(directory: Path, name: str) -> dict | None:
 - [ ] **Step 5: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_config.py tests/backup/test_status.py -v`
-Expected: PASS, 20 тестов (10 config + 10 status).
+Expected: PASS, 25 тестов (10 config + 15 status — `test_unsafe_names_are_rejected` параметризован шестью именами).
 
 - [ ] **Step 6: Коммит**
 
