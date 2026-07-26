@@ -1367,7 +1367,25 @@ git commit -m "feat(backup): validate every tar member before extracting"
 
 **Interfaces:**
 - Consumes: `hermes_backup.inventory.EXCLUDE_RULES`.
-- Produces: `UnstableSourceError(RuntimeError)`; `stabilized_copy(source: Path, staging: Path, attempts: int = 4, rsync: str = "rsync") -> int` — возвращает число выполненных проходов.
+- Produces: `UnstableSourceError(RuntimeError)`; `rsync_filter(rule: str) -> str`; `rsync_command(source: Path, staging: Path, *, dry_run: bool, rsync: str = "rsync") -> list[str]`; `stabilized_copy(source: Path, staging: Path, attempts: int = 4, rsync: str = "rsync") -> int` — возвращает число выполненных проходов.
+
+**Обязательные критерии приёмки:**
+
+1. **Владелец и группа сохраняются.** Флаги `-rlptgoH --numeric-ids`. Это `-a`
+   минус `-D`: без `-o`/`-g` staging под root получил бы `root:root`, и
+   восстановленные файлы перестали бы принадлежать владельцу данных (на Aeza —
+   `10000:10000`). `-D` намеренно не берём: он копирует device nodes и FIFO, а
+   `sha256_file` при построении inventory встанет на чтении FIFO навсегда —
+   бэкап повиснет вместо того, чтобы упасть.
+2. **Правила якорятся.** rsync сопоставляет неякорный шаблон с **концом** пути,
+   поэтому `cache/*` удалил бы и `workspace/project/cache/`. Python-правила
+   root-относительные, значит каждое корневое правило получает ведущий `/`, а
+   `*/.DS_Store` превращается в `**/.DS_Store`.
+3. **`--delete-excluded`**, иначе однажды скопированный, а затем исключённый
+   файл останется в staging навсегда.
+4. **Код возврата 24** («vanished source files») означает, что живое дерево
+   изменилось под нами, — это повод повторить проход. Любой другой ненулевой
+   код — немедленный отказ.
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -1375,51 +1393,130 @@ git commit -m "feat(backup): validate every tar member before extracting"
 # tests/backup/test_staging.py
 import pytest
 
-from hermes_backup.staging import UnstableSourceError, stabilized_copy
+from hermes_backup.staging import (
+    UnstableSourceError,
+    rsync_command,
+    rsync_filter,
+    stabilized_copy,
+)
 
 
-def test_stable_tree_is_copied_in_one_extra_pass(tmp_path):
+def test_command_preserves_ownership_and_hardlinks():
+    argv = rsync_command(Path("/srv/hermes/data"), Path("/tmp/staging"), dry_run=False)
+    assert "-rlptgoH" in argv
+    assert "--numeric-ids" in argv
+    assert "--delete-excluded" in argv
+    # -D would copy device nodes and FIFOs; hashing a FIFO would hang.
+    assert "-a" not in argv
+
+
+def test_root_rules_are_anchored_for_rsync():
+    assert rsync_filter("cache/*") == "/cache/"
+    assert rsync_filter(".npm/*") == "/.npm/"
+    assert rsync_filter("state.db-*") == "/state.db-*"
+    assert rsync_filter("sessions/request_dump_*.json") == "/sessions/request_dump_*.json"
+    assert rsync_filter("*/.DS_Store") == "**/.DS_Store"
+    assert rsync_filter("**/__pycache__/*") == "**/__pycache__/"
+
+
+def test_command_carries_anchored_not_bare_rules():
+    argv = rsync_command(Path("/srv/hermes/data"), Path("/tmp/staging"), dry_run=False)
+    assert "--exclude=/cache/" in argv
+    assert "--exclude=cache/*" not in argv
+
+
+def test_root_cache_goes_but_a_nested_cache_stays(tmp_path):
+    source = tmp_path / "data"
+    (source / "cache").mkdir(parents=True)
+    (source / "cache" / "junk.bin").write_bytes(b"0" * 32)
+    (source / "workspace" / "project" / "cache").mkdir(parents=True)
+    (source / "workspace" / "project" / "cache" / "important.bin").write_bytes(b"1" * 8)
+    staging = tmp_path / "staging"
+
+    stabilized_copy(source, staging)
+
+    assert not (staging / "cache").exists()
+    assert (staging / "workspace" / "project" / "cache" / "important.bin").read_bytes() == b"1" * 8
+
+
+def test_stable_tree_is_copied(tmp_path):
     source = tmp_path / "data"
     (source / "cron").mkdir(parents=True)
     (source / "cron" / "jobs.json").write_text('{"jobs": []}')
-    (source / "cache").mkdir()
-    (source / "cache" / "junk.bin").write_bytes(b"0" * 100)
     staging = tmp_path / "staging"
 
     passes = stabilized_copy(source, staging)
 
     assert (staging / "cron" / "jobs.json").exists()
-    assert not (staging / "cache").exists()
     assert passes >= 1
 
 
-def test_source_that_keeps_changing_fails_closed(tmp_path):
+def test_vanished_files_are_retried_not_fatal(tmp_path, monkeypatch):
+    """Exit 24 means the live tree moved under us — that is churn, not failure."""
+    source = tmp_path / "data"
+    source.mkdir()
+    (source / "keep.txt").write_text("x")
+    staging = tmp_path / "staging"
+    calls = {"n": 0}
+
+    import hermes_backup.staging as module
+
+    real = module._run_rsync
+
+    def flaky(source_path, staging_path, dry_run, rsync):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise module.VanishedFiles("exit 24")
+        return real(source_path, staging_path, dry_run, rsync)
+
+    monkeypatch.setattr(module, "_run_rsync", flaky)
+    assert stabilized_copy(source, staging) >= 1
+    assert calls["n"] > 1
+
+
+def test_other_rsync_failures_are_immediate(tmp_path, monkeypatch):
+    source = tmp_path / "data"
+    source.mkdir()
+    staging = tmp_path / "staging"
+
+    import hermes_backup.staging as module
+
+    def boom(*args, **kwargs):
+        raise UnstableSourceError("rsync failed (23): permission denied")
+
+    monkeypatch.setattr(module, "_run_rsync", boom)
+    with pytest.raises(UnstableSourceError, match="23"):
+        stabilized_copy(source, staging)
+
+
+def test_source_that_keeps_changing_fails_closed(tmp_path, monkeypatch):
     source = tmp_path / "data"
     source.mkdir()
     churn = source / "busy.log"
     churn.write_text("0")
     staging = tmp_path / "staging"
 
-    original = stabilized_copy.__globals__["_run_rsync"]
+    import hermes_backup.staging as module
+
+    real = module._run_rsync
     counter = {"n": 0}
 
-    def churning_rsync(*args, **kwargs):
+    def churning(source_path, staging_path, dry_run, rsync):
         counter["n"] += 1
         churn.write_text(f"{counter['n']}")
-        return original(*args, **kwargs)
+        return real(source_path, staging_path, dry_run, rsync)
 
-    stabilized_copy.__globals__["_run_rsync"] = churning_rsync
-    try:
-        with pytest.raises(UnstableSourceError, match="unstable_source"):
-            stabilized_copy(source, staging, attempts=2)
-    finally:
-        stabilized_copy.__globals__["_run_rsync"] = original
+    monkeypatch.setattr(module, "_run_rsync", churning)
+    with pytest.raises(UnstableSourceError, match="unstable_source"):
+        stabilized_copy(source, staging, attempts=2)
 
 
 def test_missing_source_is_reported(tmp_path):
     with pytest.raises(UnstableSourceError):
         stabilized_copy(tmp_path / "absent", tmp_path / "staging")
 ```
+
+Файл тестов начинается с `from pathlib import Path` — он нужен в первых трёх тестах.
 
 - [ ] **Step 2: Прогнать тест и убедиться, что он падает**
 
@@ -1444,23 +1541,61 @@ from pathlib import Path
 
 from hermes_backup.inventory import EXCLUDE_RULES
 
+# -rlptgoH is -a without -D: ownership and hardlinks are preserved, while
+# device nodes and FIFOs are left behind — hashing a FIFO would hang the
+# backup instead of failing it.
+RSYNC_FLAGS = ("-rlptgoH", "--numeric-ids", "--delete", "--delete-excluded", "--itemize-changes")
+VANISHED_EXIT = 24
+
 
 class UnstableSourceError(RuntimeError):
     """The source kept changing, so no consistent staging copy exists."""
 
 
-def _exclude_args() -> list[str]:
-    return [f"--exclude={rule}" for rule in EXCLUDE_RULES]
+class VanishedFiles(RuntimeError):
+    """rsync exit 24: files disappeared mid-transfer. Retryable churn."""
 
 
-def _run_rsync(source: Path, staging: Path, dry_run: bool, rsync: str) -> str:
-    command = [rsync, "-rlptH", "--delete", "--itemize-changes", *_exclude_args()]
+def rsync_filter(rule: str) -> str:
+    """Translate a root-relative fnmatch rule into an rsync filter.
+
+    rsync matches an unanchored pattern against the END of a path, so a
+    bare `cache/*` would also delete workspace/project/cache. Python's
+    rules are root-relative, so every rooted rule gains a leading slash.
+    """
+    if rule.startswith("**/"):
+        return rule[:-1] if rule.endswith("/*") else rule
+    if rule.startswith("*/"):
+        return f"**/{rule[2:]}"
+    if "/" not in rule:
+        return rule
+    if rule.endswith("/*"):
+        return f"/{rule[:-1]}"
+    return f"/{rule}"
+
+
+def rsync_command(source: Path, staging: Path, *, dry_run: bool, rsync: str = "rsync") -> list[str]:
+    command = [rsync, *RSYNC_FLAGS]
+    command += [f"--exclude={rsync_filter(rule)}" for rule in EXCLUDE_RULES]
     if dry_run:
         command += ["--dry-run", "--checksum"]
     command += [f"{source}/", f"{staging}/"]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    return command
+
+
+def _run_rsync(source: Path, staging: Path, dry_run: bool, rsync: str) -> str:
+    result = subprocess.run(
+        rsync_command(source, staging, dry_run=dry_run, rsync=rsync),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == VANISHED_EXIT:
+        raise VanishedFiles(f"rsync exit {VANISHED_EXIT}: source files vanished")
     if result.returncode != 0:
-        raise UnstableSourceError(f"rsync failed ({result.returncode}): {result.stderr.strip()}")
+        raise UnstableSourceError(
+            f"rsync failed ({result.returncode}): {result.stderr.strip()}"
+        )
     return result.stdout
 
 
@@ -1472,8 +1607,14 @@ def stabilized_copy(
     staging.mkdir(parents=True, exist_ok=True)
     changed: list[str] = []
     for attempt in range(1, attempts + 1):
-        _run_rsync(source, staging, dry_run=False, rsync=rsync)
-        changed = [line for line in _run_rsync(source, staging, True, rsync).splitlines() if line.strip()]
+        try:
+            _run_rsync(source, staging, False, rsync)
+            changed = [
+                line for line in _run_rsync(source, staging, True, rsync).splitlines() if line.strip()
+            ]
+        except VanishedFiles:
+            # The tree moved under us: that is exactly what the retry is for.
+            continue
         if not changed:
             return attempt
     raise UnstableSourceError(
@@ -1484,7 +1625,7 @@ def stabilized_copy(
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_staging.py -v`
-Expected: PASS, 3 теста.
+Expected: PASS, 9 тестов.
 
 - [ ] **Step 5: Коммит**
 
@@ -1852,6 +1993,15 @@ git commit -m "feat(backup): record run outcomes in status files"
 **до** публикации — `cron/jobs.json` через `count_cron_jobs`, `config.yaml`
 через `yaml.safe_load`. Архив с пойманным на середине записи `config.yaml` не
 должен публиковаться ни при каких условиях.
+
+**Четвёртый обязательный критерий: спецфайлы фиксируются, а не исчезают.**
+Task 8 копирует дерево флагами `-rlptgoH` без `-D`, поэтому device nodes, FIFO
+и сокеты в staging не попадают — это защита от зависания `sha256_file` на
+чтении FIFO. Но принцип «неизвестное не теряется молча» требует следа: перед
+сборкой архива пройти исходное дерево и записать каждый найденный спецфайл в
+`EXCLUSIONS.jsonl` с `type=special` и классификацией `excluded-special`,
+добавив их число в статусную строку. Тест: FIFO в исходном дереве попадает в
+`EXCLUSIONS.jsonl`, не попадает в архив и не подвешивает прогон.
 
 **Третий обязательный критерий: снимки снимаются с понижением привилегий.**
 На Aeza `state.db*`, `kanban.db` и каталог данных принадлежат `10000:10000`,
