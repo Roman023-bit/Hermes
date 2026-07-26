@@ -1339,7 +1339,10 @@ def extract(tar_path: Path, dest: Path) -> None:
     validate(tar_path)
     dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(tar_path, "r:*") as tar:
-        tar.extractall(dest)  # noqa: S202 — every member validated above
+        # filter="tar" keeps modes and internal symlinks, which the backup
+        # needs; safety comes from validate() above, not from the filter.
+        # Naming it also pins behaviour across the 3.14 default change.
+        tar.extractall(dest, filter="tar")  # noqa: S202 — every member validated above
 ```
 
 - [ ] **Step 4: Прогнать тесты**
