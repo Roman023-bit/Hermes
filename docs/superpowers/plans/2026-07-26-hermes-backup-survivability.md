@@ -1969,23 +1969,117 @@ git commit -m "feat(backup): guard the shared uplink with an flock file lock"
 
 ---
 
-### Task 10: `status.py` и `config.py` — статусы и пути
+### Task 10: `status.py` и `config.py` — статусы и настройки
 
 **Files:**
 - Create: `hermes_backup/status.py`, `hermes_backup/config.py`
-- Test: `tests/backup/test_status.py`
+- Test: `tests/backup/test_status.py`, `tests/backup/test_config.py`
 
 **Interfaces:**
 - Consumes: `hermes_backup.hashing.atomic_write_text`.
-- Produces: `write_status(directory: Path, name: str, outcome: str, reason: str = "", backup_path: str = "") -> Path`; `read_status(directory: Path, name: str) -> dict | None`; `status_line(name: str, outcome: str, reason: str = "") -> str`. В `config.py`: `SERVER_DATA`, `SERVER_ESSENTIAL_ROOT`, `SERVER_FULL_ROOT`, `SERVER_LOCK`, `MAC_OFFSITE_ROOT`, `MAC_STATUS_DIR`, `MAC_NETWORK_LOCK`, `REMOTE`, `SSH_KEY`, `RETENTION` — все читаются из env с этими значениями по умолчанию.
+- Produces: `write_status(directory, name, outcome, reason="", backup_path="") -> Path`; `read_status(directory, name) -> dict | None`; `status_line(name, outcome, reason="") -> str`; `StatusError(ValueError)`. В `config.py`: константы путей `SERVER_DATA`, `SERVER_ESSENTIAL_ROOT`, `SERVER_FULL_ROOT`, `SERVER_LOCK`, `SERVER_STATUS_DIR`, `SERVER_CONFIG`, `MAC_OFFSITE_ROOT`, `MAC_STATUS_DIR`, `MAC_NETWORK_LOCK`, `MAC_CONFIG`, `REMOTE`, `SSH_KEY`; `@dataclass BackupSettings`; `load_settings(path: Path) -> BackupSettings`; `ConfigError(ValueError)`.
 
-- [ ] **Step 1: Написать падающий тест**
+**Обязательный критерий приёмки: никаких новых `HERMES_*` env-переменных.**
+`AGENTS.md:102` запрещает их для несекретной конфигурации, `AGENTS.md:610`
+требует держать пороги и таймауты в `config.yaml`. Пути — константы с
+безопасными значениями по умолчанию, переопределяются аргументами CLI (это уже
+предусмотрено в Task 11 и 13–15). Поведенческие параметры читаются из секции
+`backup:` файла `config.yaml`: на сервере `/srv/hermes/data/config.yaml`, на
+Mac `~/.hermes/config.yaml`. Env остаётся только для настоящих секретов; путь к
+SSH-ключу секретом не является и живёт константой.
+
+- [ ] **Step 1: Написать падающие тесты**
+
+```python
+# tests/backup/test_config.py
+import pytest
+
+from hermes_backup.config import ConfigError, load_settings
+
+
+def test_missing_file_yields_documented_defaults(tmp_path):
+    settings = load_settings(tmp_path / "absent.yaml")
+    assert settings.retention_server == 7
+    assert settings.retention_mac == 7
+    assert settings.retention_mac_floor == 2
+    assert settings.freshness_hours == 26
+    assert settings.drill_staleness_hours == 48
+    assert settings.network_lock_wait_seconds == 21600
+
+
+def test_config_without_a_backup_section_yields_defaults(tmp_path):
+    target = tmp_path / "config.yaml"
+    target.write_text("model: opus
+")
+    assert load_settings(target).retention_mac == 7
+
+
+def test_backup_section_overrides_defaults(tmp_path):
+    target = tmp_path / "config.yaml"
+    target.write_text("backup:\n  retention_mac: 14\n  freshness_hours: 30\n")
+    settings = load_settings(target)
+    assert settings.retention_mac == 14
+    assert settings.freshness_hours == 30
+    assert settings.retention_server == 7
+
+
+def test_unknown_key_is_rejected(tmp_path):
+    target = tmp_path / "config.yaml"
+    target.write_text("backup:\n  retention_mac: 14\n")
+    with pytest.raises(ConfigError, match="unknown"):
+        load_settings(target)
+
+
+def test_non_integer_value_is_rejected(tmp_path):
+    target = tmp_path / "config.yaml"
+    target.write_text("backup:\n  retention_mac: plenty\n")
+    with pytest.raises(ConfigError, match="retention_mac"):
+        load_settings(target)
+
+
+def test_booleans_are_not_integers(tmp_path):
+    target = tmp_path / "config.yaml"
+    target.write_text("backup:\n  retention_mac: true\n")
+    with pytest.raises(ConfigError, match="retention_mac"):
+        load_settings(target)
+
+
+def test_non_positive_value_is_rejected(tmp_path):
+    target = tmp_path / "config.yaml"
+    target.write_text("backup:\n  retention_mac: 0\n")
+    with pytest.raises(ConfigError, match="positive"):
+        load_settings(target)
+
+
+def test_floor_above_retention_is_rejected(tmp_path):
+    """Keeping fewer copies than the floor demands would delete the floor."""
+    target = tmp_path / "config.yaml"
+    target.write_text("backup:\n  retention_mac: 2\n  retention_mac_floor: 5\n")
+    with pytest.raises(ConfigError, match="floor"):
+        load_settings(target)
+
+
+def test_backup_section_must_be_a_mapping(tmp_path):
+    target = tmp_path / "config.yaml"
+    target.write_text("backup: [1, 2]\n")
+    with pytest.raises(ConfigError, match="mapping"):
+        load_settings(target)
+
+
+def test_broken_yaml_is_rejected_not_ignored(tmp_path):
+    target = tmp_path / "config.yaml"
+    target.write_text("backup: [unclosed\n")
+    with pytest.raises(ConfigError):
+        load_settings(target)
+```
 
 ```python
 # tests/backup/test_status.py
 import json
 
-from hermes_backup.status import read_status, status_line, write_status
+import pytest
+
+from hermes_backup.status import StatusError, read_status, status_line, write_status
 
 
 def test_status_is_written_atomically_and_read_back(tmp_path):
@@ -1998,6 +2092,13 @@ def test_status_is_written_atomically_and_read_back(tmp_path):
     assert [p.name for p in tmp_path.iterdir() if p.is_file()] == ["essential_backup.json"]
 
 
+def test_status_directory_is_private(tmp_path):
+    target = tmp_path / "status"
+    write_status(target, "freshness", "OK")
+    assert target.stat().st_mode & 0o777 == 0o700
+    assert (target / "freshness.json").stat().st_mode & 0o777 == 0o600
+
+
 def test_failure_keeps_the_reason(tmp_path):
     write_status(tmp_path, "restore_drill", "FAILED", reason="integrity_check")
     assert read_status(tmp_path, "restore_drill")["reason"] == "integrity_check"
@@ -2007,6 +2108,27 @@ def test_missing_status_reads_as_none(tmp_path):
     assert read_status(tmp_path, "never_ran") is None
 
 
+def test_malformed_status_reads_as_none(tmp_path):
+    (tmp_path / "essential_backup.json").write_text("[1, 2, 3]")
+    assert read_status(tmp_path, "essential_backup") is None
+
+
+def test_status_missing_required_fields_reads_as_none(tmp_path):
+    (tmp_path / "freshness.json").write_text(json.dumps({"outcome": "OK"}))
+    assert read_status(tmp_path, "freshness") is None
+
+
+@pytest.mark.parametrize("name", ["../escape", "a/b", "with space", "", "x" * 65, "Upper"])
+def test_unsafe_names_are_rejected(tmp_path, name):
+    with pytest.raises(StatusError):
+        write_status(tmp_path, name, "OK")
+
+
+def test_unknown_outcome_is_rejected(tmp_path):
+    with pytest.raises(StatusError, match="outcome"):
+        write_status(tmp_path, "freshness", "MAYBE")
+
+
 def test_status_line_carries_the_hermes_prefix():
     assert status_line("offsite_pull", "FAILED", "lock_timeout") == (
         "hermes_offsite_pull_FAILED lock_timeout"
@@ -2014,17 +2136,110 @@ def test_status_line_carries_the_hermes_prefix():
     assert status_line("essential_backup", "OK") == "hermes_essential_backup_OK"
 
 
-def test_status_file_is_valid_json(tmp_path):
-    write_status(tmp_path, "freshness", "OK")
-    json.loads((tmp_path / "freshness.json").read_text())
+def test_status_line_stays_one_line():
+    """A multi-line traceback in the reason must not fake extra statuses."""
+    line = status_line("restore_drill", "FAILED", "boom\nhermes_restore_drill_OK")
+    assert "\n" not in line
+    assert line.count("hermes_restore_drill") == 2
 ```
 
-- [ ] **Step 2: Прогнать тест и убедиться, что он падает**
+- [ ] **Step 2: Прогнать тесты и убедиться, что они падают**
 
-Run: `.venv/bin/python -m pytest tests/backup/test_status.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'hermes_backup.status'`
+Run: `.venv/bin/python -m pytest tests/backup/test_config.py tests/backup/test_status.py -v`
+Expected: FAIL — модулей `hermes_backup.config` и `hermes_backup.status` нет.
 
-- [ ] **Step 3: Реализовать модули**
+- [ ] **Step 3: Реализовать `config.py`**
+
+```python
+# hermes_backup/config.py
+"""Paths and backup settings.
+
+No new HERMES_* environment variables: AGENTS.md reserves .env for
+credentials and puts every threshold and timeout in config.yaml. Paths
+are constants here and are overridden by CLI arguments where a test or an
+operator needs a different location.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+
+SERVER_DATA = Path("/srv/hermes/data")
+SERVER_ESSENTIAL_ROOT = Path("/srv/hermes/backups/essential")
+SERVER_FULL_ROOT = Path("/srv/hermes/backups")
+SERVER_LOCK = Path("/run/lock/hermes-backup.lock")
+SERVER_STATUS_DIR = Path("/var/lib/hermes-backup/status")
+SERVER_CONFIG = SERVER_DATA / "config.yaml"
+
+MAC_OFFSITE_ROOT = Path("~/.local/share/hermes/offsite-backups").expanduser()
+MAC_STATUS_DIR = Path("~/.local/share/hermes/status").expanduser()
+MAC_NETWORK_LOCK = Path(
+    "~/Library/Application Support/offsite-sync/network.lock"
+).expanduser()
+MAC_CONFIG = Path("~/.hermes/config.yaml").expanduser()
+
+REMOTE = "root@138.124.108.97"
+SSH_KEY = Path("~/.ssh/aeza_hermes").expanduser()
+
+DEFAULTS: dict[str, int] = {
+    "retention_server": 7,
+    "retention_mac": 7,
+    "retention_mac_floor": 2,
+    "freshness_hours": 26,
+    "drill_staleness_hours": 48,
+    "network_lock_wait_seconds": 6 * 3600,
+}
+
+
+class ConfigError(ValueError):
+    """The backup section of config.yaml is malformed."""
+
+
+@dataclass(frozen=True)
+class BackupSettings:
+    retention_server: int
+    retention_mac: int
+    retention_mac_floor: int
+    freshness_hours: int
+    drill_staleness_hours: int
+    network_lock_wait_seconds: int
+
+
+def load_settings(path: Path) -> BackupSettings:
+    values = dict(DEFAULTS)
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, yaml.YAMLError) as error:
+        raise ConfigError(f"{path}: {error}") from error
+
+    section = raw.get("backup", {}) if isinstance(raw, dict) else None
+    if section is None or not isinstance(section, dict):
+        raise ConfigError(f"{path}: backup must be a mapping")
+
+    for key, value in section.items():
+        if key not in DEFAULTS:
+            raise ConfigError(f"{path}: unknown backup key {key!r}")
+        # bool is an int in Python, and `retention_mac: true` is a typo,
+        # not a setting.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"{path}: {key} expects an integer")
+        if value <= 0:
+            raise ConfigError(f"{path}: {key} must be positive")
+        values[key] = value
+
+    if values["retention_mac_floor"] > values["retention_mac"]:
+        raise ConfigError(
+            f"{path}: retention_mac_floor exceeds retention_mac — the floor would be pruned"
+        )
+    return BackupSettings(**values)
+```
+
+- [ ] **Step 4: Реализовать `status.py`**
 
 ```python
 # hermes_backup/status.py
@@ -2037,21 +2252,39 @@ of parsing free-form logs.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from hermes_backup.hashing import atomic_write_text
 
+OUTCOMES = frozenset({"OK", "FAILED", "SKIPPED"})
+_SAFE_NAME = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
+_REQUIRED_FIELDS = ("name", "outcome", "reason", "backup_path", "finished_at")
+
+
+class StatusError(ValueError):
+    """A status name or outcome is not one this module will write."""
+
 
 def status_line(name: str, outcome: str, reason: str = "") -> str:
     line = f"hermes_{name}_{outcome}"
-    return f"{line} {reason}" if reason else line
+    if not reason:
+        return line
+    # Keep it one line: a multi-line traceback in the reason would look
+    # like several status lines to whoever greps the log.
+    return f"{line} {' '.join(reason.split())}"
 
 
 def write_status(
     directory: Path, name: str, outcome: str, reason: str = "", backup_path: str = ""
 ) -> Path:
+    if not _SAFE_NAME.match(name):
+        raise StatusError(f"unsafe status name: {name!r}")
+    if outcome not in OUTCOMES:
+        raise StatusError(f"unknown outcome: {outcome!r}")
     directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
     target = directory / f"{name}.json"
     atomic_write_text(
         target,
@@ -2071,60 +2304,30 @@ def write_status(
 
 
 def read_status(directory: Path, name: str) -> dict | None:
-    target = directory / f"{name}.json"
+    if not _SAFE_NAME.match(name):
+        raise StatusError(f"unsafe status name: {name!r}")
     try:
-        return json.loads(target.read_text(encoding="utf-8"))
+        record = json.loads((directory / f"{name}.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(record, dict) or any(field not in record for field in _REQUIRED_FIELDS):
+        return None
+    if record["outcome"] not in OUTCOMES:
+        return None
+    return record
 ```
 
-```python
-# hermes_backup/config.py
-"""Paths and knobs, all overridable through the environment for tests."""
+- [ ] **Step 5: Прогнать тесты**
 
-from __future__ import annotations
+Run: `.venv/bin/python -m pytest tests/backup/test_config.py tests/backup/test_status.py -v`
+Expected: PASS, 20 тестов (10 config + 10 status).
 
-import os
-from pathlib import Path
-
-
-def _path(name: str, default: str) -> Path:
-    return Path(os.environ.get(name, default)).expanduser()
-
-
-SERVER_DATA = _path("HERMES_BACKUP_DATA", "/srv/hermes/data")
-SERVER_ESSENTIAL_ROOT = _path("HERMES_BACKUP_ESSENTIAL_ROOT", "/srv/hermes/backups/essential")
-SERVER_FULL_ROOT = _path("HERMES_BACKUP_FULL_ROOT", "/srv/hermes/backups")
-SERVER_LOCK = _path("HERMES_BACKUP_LOCK", "/run/lock/hermes-backup.lock")
-SERVER_STATUS_DIR = _path("HERMES_BACKUP_STATUS_DIR", "/var/lib/hermes-backup/status")
-
-MAC_OFFSITE_ROOT = _path("HERMES_OFFSITE_ROOT", "~/.local/share/hermes/offsite-backups")
-MAC_STATUS_DIR = _path("HERMES_STATUS_DIR", "~/.local/share/hermes/status")
-MAC_NETWORK_LOCK = _path(
-    "OFFSITE_NETWORK_LOCK", "~/Library/Application Support/offsite-sync/network.lock"
-)
-
-REMOTE = os.environ.get("HERMES_BACKUP_REMOTE", "root@138.124.108.97")
-SSH_KEY = _path("HERMES_BACKUP_SSH_KEY", "~/.ssh/aeza_hermes")
-
-RETENTION_SERVER = int(os.environ.get("HERMES_BACKUP_RETENTION_SERVER", "7"))
-RETENTION_MAC = int(os.environ.get("HERMES_BACKUP_RETENTION_MAC", "7"))
-RETENTION_MAC_FLOOR = int(os.environ.get("HERMES_BACKUP_RETENTION_MAC_FLOOR", "2"))
-FRESHNESS_HOURS = int(os.environ.get("HERMES_BACKUP_FRESHNESS_HOURS", "26"))
-DRILL_STALENESS_HOURS = int(os.environ.get("HERMES_DRILL_STALENESS_HOURS", "48"))
-NETWORK_LOCK_WAIT_SECONDS = int(os.environ.get("OFFSITE_LOCK_WAIT_SECONDS", str(6 * 3600)))
-```
-
-- [ ] **Step 4: Прогнать тесты**
-
-Run: `.venv/bin/python -m pytest tests/backup/test_status.py -v`
-Expected: PASS, 5 тестов.
-
-- [ ] **Step 5: Коммит**
+- [ ] **Step 6: Коммит**
 
 ```bash
-git add hermes_backup/status.py hermes_backup/config.py tests/backup/test_status.py
-git commit -m "feat(backup): record run outcomes in status files"
+git add hermes_backup/status.py hermes_backup/config.py \
+        tests/backup/test_status.py tests/backup/test_config.py
+git commit -m "feat(backup): read backup settings from config.yaml, not env vars"
 ```
 
 ---
@@ -2445,6 +2648,7 @@ from pathlib import Path
 
 from hermes_backup import config
 from hermes_backup.archive import create
+from hermes_backup.config import DEFAULTS, BackupSettings, load_settings
 from hermes_backup.counters import count_cron_jobs, count_plugins, count_sessions, count_skills
 from hermes_backup.hashing import atomic_write_text, sha256_file, write_sha256sums
 from hermes_backup.inventory import write_exclusions, write_inventory
@@ -2488,7 +2692,15 @@ def _tree_bytes(root: Path) -> int:
     return sum(item.stat().st_size for item in root.rglob("*") if item.is_file())
 
 
-def run(data: Path, root: Path, *, rsync: str = "rsync", repo: Path | None = None) -> Path:
+def run(
+    data: Path,
+    root: Path,
+    *,
+    rsync: str = "rsync",
+    repo: Path | None = None,
+    settings: BackupSettings | None = None,
+) -> Path:
+    settings = settings or BackupSettings(**DEFAULTS)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root.mkdir(parents=True, exist_ok=True)
     partial = root / f".daily-{stamp}.partial"
@@ -2556,7 +2768,7 @@ def run(data: Path, root: Path, *, rsync: str = "rsync", repo: Path | None = Non
     except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
         raise
-    _prune(root, config.RETENTION_SERVER)
+    _prune(root, settings.retention_server)
     return published
 
 
@@ -2599,9 +2811,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data", type=Path, default=config.SERVER_DATA)
     parser.add_argument("--root", type=Path, default=config.SERVER_ESSENTIAL_ROOT)
     parser.add_argument("--status-dir", type=Path, default=config.SERVER_STATUS_DIR)
+    parser.add_argument("--config", type=Path, default=config.SERVER_CONFIG)
     args = parser.parse_args(argv)
     try:
-        published = run(args.data, args.root)
+        published = run(args.data, args.root, settings=load_settings(args.config))
     except LockBusy as error:
         print(status_line("essential_backup", "SKIPPED", f"locked {error}"))
         return 75
@@ -3024,6 +3237,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from hermes_backup import config
+from hermes_backup.config import ConfigError, load_settings
 from hermes_backup.filevault import FileVaultOff, require_filevault
 from hermes_backup.hashing import sha256_file
 from hermes_backup.locks import FileLock, LockBusy, LockTimeout
@@ -3139,23 +3353,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=config.MAC_OFFSITE_ROOT)
     parser.add_argument("--status-dir", type=Path, default=config.MAC_STATUS_DIR)
+    parser.add_argument("--config", type=Path, default=config.MAC_CONFIG)
     args = parser.parse_args(argv)
     try:
+        settings = load_settings(args.config)
         require_filevault()
-    except FileVaultOff as error:
+    except (FileVaultOff, ConfigError) as error:
         write_status(args.status_dir, "offsite_pull", "FAILED", reason=str(error))
         print(status_line("offsite_pull", "FAILED", str(error)), file=sys.stderr)
         return 1
     lock = FileLock(config.MAC_NETWORK_LOCK, owner="hermes-pull")
     try:
-        lock.acquire(wait_seconds=config.NETWORK_LOCK_WAIT_SECONDS)
+        lock.acquire(wait_seconds=settings.network_lock_wait_seconds)
     except (LockBusy, LockTimeout) as error:
         write_status(args.status_dir, "offsite_pull", "FAILED", reason="lock_timeout")
         print(status_line("offsite_pull", "FAILED", f"lock_timeout {error}"), file=sys.stderr)
         return 1
     try:
         published = pull(args.root, config.REMOTE, config.SSH_KEY)
-        prune(args.root, config.RETENTION_MAC, config.RETENTION_MAC_FLOOR)
+        prune(args.root, settings.retention_mac, settings.retention_mac_floor)
     except BaseException as error:  # noqa: BLE001 — status must always be emitted
         write_status(args.status_dir, "offsite_pull", "FAILED", reason=str(error))
         print(status_line("offsite_pull", "FAILED", str(error)), file=sys.stderr)
@@ -3166,7 +3382,7 @@ def main(argv: list[str] | None = None) -> int:
     print(status_line("offsite_pull", "OK", f"path={published}"))
 
     try:
-        fresh = check_freshness(args.root, config.FRESHNESS_HOURS)
+        fresh = check_freshness(args.root, settings.freshness_hours)
     except RuntimeError as error:
         write_status(args.status_dir, "freshness", "FAILED", reason=str(error))
         print(status_line("freshness", "FAILED", str(error)), file=sys.stderr)
@@ -3435,6 +3651,7 @@ import yaml
 
 from hermes_backup import config
 from hermes_backup.archive import ArchiveError, extract
+from hermes_backup.config import DEFAULTS, load_settings
 from hermes_backup.counters import (
     CounterError,
     count_cron_jobs,
@@ -3492,7 +3709,7 @@ def _check_counts(tree: Path, state: dict) -> dict:
     return counts
 
 
-def drill(backup: Path, *, staleness_hours: int = config.DRILL_STALENESS_HOURS) -> dict:
+def drill(backup: Path, *, staleness_hours: int = DEFAULTS["drill_staleness_hours"]) -> dict:
     _check_age(backup, staleness_hours)
     _check_sums(backup)
     try:
@@ -3552,7 +3769,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=config.MAC_OFFSITE_ROOT)
     parser.add_argument("--backup", type=Path, default=None)
     parser.add_argument("--status-dir", type=Path, default=config.MAC_STATUS_DIR)
+    parser.add_argument("--config", type=Path, default=config.MAC_CONFIG)
     args = parser.parse_args(argv)
+    settings = load_settings(args.config)
 
     backup = args.backup
     if backup is None:
@@ -3564,7 +3783,7 @@ def main(argv: list[str] | None = None) -> int:
         backup = candidates[-1]
 
     try:
-        summary = drill(backup)
+        summary = drill(backup, staleness_hours=settings.drill_staleness_hours)
     except (DrillError, OSError) as error:
         write_status(args.status_dir, "restore_drill", "FAILED", reason=str(error), backup_path=str(backup))
         print(status_line("restore_drill", "FAILED", str(error)), file=sys.stderr)
@@ -4036,7 +4255,7 @@ if [ -z "${KF_PULL_LOCKED:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   exec env KF_PULL_LOCKED=1 python3 "$SCRIPT_DIR/offsite_lock.py" \
     --owner kf-pull \
-    --wait "${OFFSITE_LOCK_WAIT_SECONDS:-21600}" \
+    --wait 21600 \
     -- "${BASH_SOURCE[0]}" "$@"
 fi
 ```
@@ -4065,12 +4284,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_LOCK = Path(
-    os.environ.get(
-        "OFFSITE_NETWORK_LOCK",
-        str(Path.home() / "Library/Application Support/offsite-sync/network.lock"),
-    )
-)
+# Constant, not an environment variable: the path is behaviour, not a
+# secret, and tests point elsewhere with --lock.
+DEFAULT_LOCK = Path.home() / "Library/Application Support/offsite-sync/network.lock"
 
 
 def main() -> int:
