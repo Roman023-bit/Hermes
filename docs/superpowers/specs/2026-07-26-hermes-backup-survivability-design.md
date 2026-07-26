@@ -476,9 +476,14 @@ SHA256SUMS           суммы всех файлов каталога, кром
 | Restore-drill | Mac | воскресенье, 11:00 местного |
 
 Слоты на Aeza разводятся с бэкапом Knowledge Factory (02:18 UTC), чтобы диск и
-CPU не совпадали по пикам. Drill поставлен на воскресенье, чтобы не совпадать с
-restore-drill'ом Knowledge Factory (суббота, 01:40 UTC), и запускается после
-дневного окна pull'а, а не одновременно с ним.
+CPU не совпадали по пикам. Drill Hermes поставлен на воскресенье и запускается
+после дневного окна pull'а, а не одновременно с ним.
+
+Не путать с restore-drill'ом Knowledge Factory: тот **ежемесячный** и живёт на
+Aeza (`OnCalendar=monthly`, `RandomizedDelaySec=2h`, юнит так и назван —
+«Monthly Knowledge Factory restore drill»). Проверено 2026-07-27 по юниту и по
+исходному коммиту `add isolated monthly restore drill`. Еженедельный здесь
+только drill Hermes, и он выполняется на Mac над стянутой копией.
 
 ## Риски
 
