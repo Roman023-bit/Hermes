@@ -5234,20 +5234,40 @@ git commit -m "feat(backup): drill the pulled copy without starting Hermes"
 - Test: `tests/backup/test_backup_status.py`
 
 **Interfaces:**
-- Consumes: `status.read_status`, `config.*`.
+- Consumes: `status.read_status`, `offsite_pull.verify_backup`, `locks.held_by`, `config.*`.
 - Produces: `summary(root: Path, status_dir: Path, lock: Path) -> str`; `main(argv=None) -> int`.
+
+**Обязательные критерии приёмки:**
+
+1. **Возраст — из `STATE.CREATED_AT`**, не из `mtime`: сводка должна показывать
+   возраст самого бэкапа, а не времени его загрузки.
+2. **Свежайший каталог проверяется через `verify_backup()`.** Непригодная копия
+   должна называться непригодной, а не показываться как обычная.
+3. **`UNCLASSIFIED_FILE_COUNT` выводится** — этого требует спека, это сигнал
+   обновить классификацию.
+4. **Обёртка через `BASH_SOURCE`**, без `HERMES_REPO`.
 
 - [ ] **Step 1: Написать падающий тест**
 
 ```python
 # tests/backup/test_backup_status.py
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 from hermes_backup.backup_status import summary
+from hermes_backup.locks import FileLock
 from hermes_backup.status import write_status
+from tests.backup.test_offsite_pull import _make_backup
+
+REPO = Path(__file__).resolve().parents[2]
+WRAPPER = REPO / "deploy" / "macos" / "hermes_backup_status.sh"
+STAMP = "20260726T031500Z"
 
 
 def test_summary_reports_every_component(tmp_path):
     root = tmp_path / "offsite"
-    (root / "daily-20260726T031500Z").mkdir(parents=True)
+    _make_backup(root / f"daily-{STAMP}")
     status_dir = tmp_path / "status"
     write_status(status_dir, "offsite_pull", "OK")
     write_status(status_dir, "freshness", "OK")
@@ -5255,10 +5275,41 @@ def test_summary_reports_every_component(tmp_path):
 
     text = summary(root, status_dir, tmp_path / "network.lock")
 
-    assert "daily-20260726T031500Z" in text
+    assert f"daily-{STAMP}" in text
     assert "restore_drill: FAILED" in text
     assert "checksum_mismatch" in text
     assert "network lock: free" in text
+
+
+def test_age_comes_from_created_at_not_from_the_download_time(tmp_path):
+    """A week-old archive pulled a minute ago is a week old."""
+    root = tmp_path / "offsite"
+    old = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    directory = _make_backup(root / f"daily-{STAMP}", created_at=old)
+    os.utime(directory, None)
+
+    text = summary(root, tmp_path / "status", tmp_path / "network.lock")
+
+    assert "168." in text or "167." in text
+    assert "0.0 h" not in text
+
+
+def test_unclassified_count_is_shown(tmp_path):
+    root = tmp_path / "offsite"
+    _make_backup(root / f"daily-{STAMP}")
+    text = summary(root, tmp_path / "status", tmp_path / "network.lock")
+    assert "unclassified files: 0" in text
+
+
+def test_an_unusable_backup_is_named_as_such(tmp_path):
+    root = tmp_path / "offsite"
+    directory = _make_backup(root / f"daily-{STAMP}")
+    (directory / "surprise.txt").write_text("x")
+
+    text = summary(root, tmp_path / "status", tmp_path / "network.lock")
+
+    assert "UNUSABLE" in text
+    assert "unexpected" in text
 
 
 def test_missing_components_are_named_not_hidden(tmp_path):
@@ -5268,13 +5319,19 @@ def test_missing_components_are_named_not_hidden(tmp_path):
 
 
 def test_held_lock_is_reported_with_owner(tmp_path):
-    from hermes_backup.locks import FileLock
-
     lock = tmp_path / "network.lock"
     with FileLock(lock, owner="kf-pull"):
         text = summary(tmp_path / "offsite", tmp_path / "status", lock)
     assert "kf-pull" in text
     assert "held by" in text
+
+
+def test_wrapper_locates_the_repository_relative_to_itself():
+    text = WRAPPER.read_text()
+    assert "BASH_SOURCE" in text
+    assert 'cd "$REPO"' in text
+    assert ".venv/bin/python" in text
+    assert "HERMES_REPO" not in text
 ```
 
 - [ ] **Step 2: Прогнать тест и убедиться, что он падает**
@@ -5291,26 +5348,47 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'hermes_backup.backup_s
 from __future__ import annotations
 
 import argparse
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 from hermes_backup import config
 from hermes_backup.locks import held_by
+from hermes_backup.offsite_pull import verify_backup
 from hermes_backup.status import read_status
 
 COMPONENTS = ("offsite_pull", "freshness", "restore_drill")
 
 
+def _describe_latest(root: Path) -> list[str]:
+    backups = (
+        sorted(item for item in root.glob("daily-*") if item.is_dir())
+        if root.exists()
+        else []
+    )
+    if not backups:
+        return ["latest backup: no backups"]
+    newest = backups[-1]
+    try:
+        state = verify_backup(newest)
+    except RuntimeError as error:
+        return [f"latest backup: {newest.name} — UNUSABLE: {error}"]
+    try:
+        created = datetime.strptime(
+            str(state["CREATED_AT"]), "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return [f"latest backup: {newest.name} — UNUSABLE: created_at_invalid"]
+    # Age of the backup, not of the download: a week-old archive pulled a
+    # minute ago is a week old.
+    age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+    return [
+        f"latest backup: {newest.name} ({age_hours:.1f} h old, {len(backups)} kept)",
+        f"unclassified files: {state['UNCLASSIFIED_FILE_COUNT']}",
+    ]
+
+
 def summary(root: Path, status_dir: Path, lock: Path) -> str:
-    lines: list[str] = []
-    backups = sorted(item for item in root.glob("daily-*") if item.is_dir()) if root.exists() else []
-    if backups:
-        newest = backups[-1]
-        age_hours = (datetime.now(timezone.utc).timestamp() - newest.stat().st_mtime) / 3600
-        lines.append(f"latest backup: {newest.name} ({age_hours:.1f} h old, {len(backups)} kept)")
-    else:
-        lines.append("latest backup: no backups")
+    lines = _describe_latest(root)
 
     for name in COMPONENTS:
         record = read_status(status_dir, name)
@@ -5350,15 +5428,18 @@ if __name__ == "__main__":
 ```bash
 # deploy/macos/hermes_backup_status.sh
 #!/usr/bin/env bash
+# The repository root is derived from this file's own location, exactly as
+# the pull and drill wrappers do.
 set -euo pipefail
-REPO="${HERMES_REPO:-/Users/romanmizanov/Documents/Hermes}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO"
 exec "$REPO/.venv/bin/python" -m hermes_backup.backup_status "$@"
 ```
 
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_backup_status.py -v`
-Expected: PASS, 3 теста.
+Expected: PASS, 7 тестов.
 
 - [ ] **Step 5: Коммит**
 
@@ -5368,6 +5449,7 @@ git add hermes_backup/backup_status.py deploy/macos/hermes_backup_status.sh \
         tests/backup/test_backup_status.py
 git commit -m "feat(backup): summarize backup health from status files"
 ```
+
 
 ---
 
