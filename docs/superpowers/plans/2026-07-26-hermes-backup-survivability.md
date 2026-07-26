@@ -1567,8 +1567,6 @@ def rsync_filter(rule: str) -> str:
         return rule[:-1] if rule.endswith("/*") else rule
     if rule.startswith("*/"):
         return f"**/{rule[2:]}"
-    if "/" not in rule:
-        return rule
     if rule.endswith("/*"):
         return f"/{rule[:-1]}"
     return f"/{rule}"
