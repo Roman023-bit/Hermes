@@ -6264,9 +6264,13 @@ install -m 0755 "$KF/scripts/offsite_lock.py" "$RUNTIME/offsite_lock.py"
 diff -q "$KF/scripts/pull_backups_from_aeza.sh" "$RUNTIME/pull_backups_from_aeza.sh"
 diff -q "$KF/scripts/offsite_lock.py" "$RUNTIME/offsite_lock.py"
 echo "обе части установлены"
-```
 
-Агент вернётся в Step C3, после миграции лока.
+# Вернуть агент сразу: общего лока ещё нет, активных стягиваний тоже, и новый
+# скрипт создаст lock-файл сам. Держать офсайт KF выключенным до конца
+# развёртывания Hermes значило бы без нужды копить отставание копий.
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.knowledge-factory.backup-pull.plist
+launchctl list | grep knowledge-factory.backup-pull
+```
 
 #### Фаза B. Выкатка Hermes на Aeza
 
@@ -6422,7 +6426,9 @@ cp /Users/romanmizanov/Documents/Hermes/deploy/macos/com.hermes.offsite-pull.pli
 cp /Users/romanmizanov/Documents/Hermes/deploy/macos/com.hermes.restore-drill.plist ~/Library/LaunchAgents/
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.hermes.offsite-pull.plist
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.hermes.restore-drill.plist
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.knowledge-factory.backup-pull.plist
+# KF-агент уже вернулся в Step A9 и его скрипты там же установлены —
+# повторно ставить и загружать нечего.
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.knowledge-factory.backup-pull.plist 2>/dev/null || true
 launchctl list | grep -E "com.hermes|knowledge-factory"
 ```
 
