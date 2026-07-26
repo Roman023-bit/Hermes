@@ -1775,6 +1775,31 @@ def test_lock_file_survives_release(tmp_path):
     assert held_by(path) is None
 
 
+def test_failed_metadata_write_does_not_leave_the_lock_held(tmp_path, monkeypatch):
+    """A lock nobody can see is worse than no lock at all."""
+    import hermes_backup.locks as module
+
+    path = tmp_path / "network.lock"
+    monkeypatch.setattr(
+        module, "_meta_path", lambda p: tmp_path / "absent-dir" / "meta.json"
+    )
+    with pytest.raises(OSError):
+        module.FileLock(path, owner="hermes-pull").acquire()
+    monkeypatch.undo()
+    assert held_by(path) is None
+
+
+def test_double_acquire_on_one_instance_is_rejected(tmp_path):
+    path = tmp_path / "network.lock"
+    lock = FileLock(path, owner="hermes-pull")
+    lock.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="already held"):
+            lock.acquire()
+    finally:
+        lock.release()
+
+
 def test_metadata_records_pid_owner_and_time(tmp_path):
     path = tmp_path / "network.lock"
     with FileLock(path, owner="hermes-pull"):
@@ -1804,6 +1829,7 @@ removing the directory a third process can take it.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -1812,6 +1838,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _POLL_SECONDS = 5
+_CONTENDED = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK})
 
 
 class LockBusy(RuntimeError):
@@ -1856,15 +1883,26 @@ class FileLock:
         self._fd: int | None = None
 
     def acquire(self, wait_seconds: int = 0) -> "FileLock":
+        if self._fd is not None:
+            raise RuntimeError("lock already held by this instance")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # The file itself is permanent; only the flock on it comes and goes.
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        # O_CREAT's mode only applies when the file is new, and this one
+        # outlives every run: fix the mode on an inherited file too.
+        os.fchmod(fd, 0o600)
         deadline = time.monotonic() + wait_seconds
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except OSError:
+            except OSError as error:
+                # Only contention is retryable. EBADF, ENOLCK and friends
+                # mean something is wrong with the file, not that someone
+                # else holds it, and must not masquerade as a busy lock.
+                if error.errno not in _CONTENDED:
+                    os.close(fd)
+                    raise
                 holder = read_meta(self.path) or {}
                 if wait_seconds <= 0:
                     os.close(fd)
@@ -1876,7 +1914,12 @@ class FileLock:
                     ) from None
                 time.sleep(min(_POLL_SECONDS, max(0.1, deadline - time.monotonic())))
         self._fd = fd
-        self._write_meta()
+        try:
+            self._write_meta()
+        except OSError:
+            # Never return holding a lock the caller does not know about.
+            self.release()
+            raise
         return self
 
     def _write_meta(self) -> None:
@@ -1900,7 +1943,7 @@ class FileLock:
         # pointing at the same path must not be able to free someone else.
         if self._fd is None:
             return
-        _meta_path(self.path).unlink(missing_ok=True)
+        _meta_path(self.path).unlink(missing_ok=True)  # missing after a failed write
         fcntl.flock(self._fd, fcntl.LOCK_UN)
         os.close(self._fd)
         self._fd = None
@@ -4070,7 +4113,10 @@ def main() -> int:
     os.chmod(tmp, 0o600)
     os.replace(tmp, meta)
     try:
-        return subprocess.run(command, check=False).returncode
+        # Hand the descriptor to the child: if this wrapper is killed, the
+        # lock must stay held while the transfer it started is still
+        # running, or a second puller would join it on one narrow uplink.
+        return subprocess.run(command, check=False, pass_fds=(fd,)).returncode
     finally:
         meta.unlink(missing_ok=True)
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -4090,6 +4136,39 @@ def test_script_reexecs_itself_under_the_shared_flock():
     assert "KF_PULL_LOCKED" in text
     # No home-grown mkdir protocol: the lock must be the shared flock file.
     assert "mkdir \"$LOCK_DIR\"" not in text
+
+
+def test_lock_outlives_a_killed_wrapper_while_the_child_runs(tmp_path):
+    """SIGKILL on the wrapper must not hand the uplink to a second puller
+    while the rsync it launched is still transferring."""
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    lock = tmp_path / "network.lock"
+    wrapper = REPO / "scripts" / "offsite_lock.py"
+    holder = subprocess.Popen(
+        [
+            sys.executable, str(wrapper), "--owner", "kf-pull", "--lock", str(lock),
+            "--", "sleep", "5",
+        ]
+    )
+    time.sleep(1)
+    holder.send_signal(signal.SIGKILL)
+    holder.wait()
+
+    contender = subprocess.run(
+        [
+            sys.executable, str(wrapper), "--owner", "hermes-pull", "--wait", "1",
+            "--lock", str(lock), "--", "true",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert contender.returncode == 1
+    assert "lock_timeout" in contender.stderr
+    subprocess.run(["pkill", "-f", "sleep 5"], check=False)
 
 
 def test_wrapper_releases_the_lock_when_the_child_dies(tmp_path):
