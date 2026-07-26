@@ -2335,124 +2335,30 @@ git commit -m "feat(backup): read backup settings from config.yaml, not env vars
 ### Task 11: `essential_backup.py` — оркестрация на Aeza
 
 **Files:**
-- Create: `hermes_backup/essential_backup.py`, `deploy/beget/hermes_essential_backup.sh`, `deploy/beget/systemd/hermes-essential-backup.service`, `deploy/beget/systemd/hermes-essential-backup.timer`
+- Create: `hermes_backup/essential_backup.py`, `hermes_backup/snapshot_cli.py`, `deploy/beget/hermes_essential_backup.sh`, `deploy/beget/systemd/hermes-essential-backup.service`, `deploy/beget/systemd/hermes-essential-backup.timer`
+- Modify: `hermes_backup/state.py` (ключ `EXCLUDED_SPECIAL_COUNT`, валидация в `format_state`), `hermes_backup/inventory.py` (спецфайлы), `tests/backup/test_state.py`, `tests/backup/test_inventory.py`
 - Test: `tests/backup/test_essential_backup.py`
 
 **Interfaces:**
-- Consumes: `staging.stabilized_copy`, `sqlite_snapshot.*`, `inventory.write_inventory/write_exclusions`, `counters.*`, `state.format_state`, `archive.create`, `hashing.write_sha256sums`, `status.write_status/status_line`, `config.*`.
-- Produces: `run(data: Path, root: Path, *, rsync: str = "rsync") -> Path` — возвращает путь опубликованного каталога; `main(argv: list[str] | None = None) -> int`; коды выхода `0`, `1`, `75`.
+- Consumes: `staging.stabilized_copy`, `sqlite_snapshot.*`, `inventory.write_inventory/write_exclusions`, `counters.*`, `state.format_state`, `archive.create/validate`, `hashing.write_sha256sums/sha256_file`, `status.write_status/status_line`, `config.load_settings`.
+- Produces: `run(data, root, *, rsync="rsync", repo=None, settings=None, snapshot_runner=None) -> Path`; `owner_of(path) -> tuple[int, int]`; `require_single_owner(paths) -> tuple[int, int]`; `snapshot_command(uid, gid, data, dest, names) -> list[str]`; `main(argv=None) -> int`; коды выхода `0`, `1`, `75`.
 
-**Обязательный критерий приёмки:** структурированные файлы staging разбираются
-**до** публикации — `cron/jobs.json` через `count_cron_jobs`, `config.yaml`
-через `yaml.safe_load`. Архив с пойманным на середине записи `config.yaml` не
-должен публиковаться ни при каких условиях.
+#### Обязательные критерии приёмки
 
-**Четвёртый обязательный критерий: спецфайлы фиксируются, а не исчезают.**
-Task 8 копирует дерево флагами `-rlptgoH` без `-D`, поэтому device nodes, FIFO
-и сокеты в staging не попадают — это защита от зависания `sha256_file` на
-чтении FIFO. Но принцип «неизвестное не теряется молча» требует следа: перед
-сборкой архива пройти исходное дерево и записать каждый найденный спецфайл в
-`EXCLUSIONS.jsonl` с `type=special` и классификацией `excluded-special`,
-добавив их число в статусную строку. Тест: FIFO в исходном дереве попадает в
-`EXCLUSIONS.jsonl`, не попадает в архив и не подвешивает прогон.
+1. **`config.yaml` разбирается до публикации.** `cron/jobs.json` — через
+   `count_cron_jobs`, `config.yaml` — через `yaml.safe_load` по staging-копии.
+   Архив с пойманным на середине записи конфигом не публикуется никогда.
+2. **`format_state` валидирует то, что пишет.** `parse_state` проверяет
+   строковые значения регуляркой, `format_state` — нет; `HERMES_IMAGE_REF` и
+   `HERMES_GIT_SHA` приходят из вывода `docker` и `git`, то есть извне.
+3. **Снимки снимаются с понижением привилегий** через `snapshot_runner`.
+4. **Спецфайлы фиксируются, а не исчезают.**
 
-**Третий обязательный критерий: снимки снимаются с понижением привилегий.**
-На Aeza `state.db*`, `kanban.db` и каталог данных принадлежат `10000:10000`,
-процесс Hermes держит БД открытой. Root-соединение в момент, когда БД никем не
-открыта, создаст `-wal`/`-shm` с владельцем root; падение процесса между
-открытием и закрытием оставит их на диске, и Hermes потеряет запись в
-собственную базу. Реализовать в `hermes_backup/essential_backup.py`:
+#### Правки в готовых модулях
 
-```python
-def owner_of(path: Path) -> tuple[int, int]:
-    info = path.stat()
-    return info.st_uid, info.st_gid
+- [ ] **Step 1: Добавить `EXCLUDED_SPECIAL_COUNT` и валидацию в `state.py`**
 
-
-def require_single_owner(paths: Sequence[Path]) -> tuple[int, int]:
-    """Every database artefact must belong to one owner, or we stop.
-
-    A split owner means someone already ran a backup as the wrong user;
-    chowning a live tree under a running Hermes would be worse.
-    """
-    owners = {path: owner_of(path) for path in paths if path.exists()}
-    distinct = set(owners.values())
-    if len(distinct) != 1:
-        raise RuntimeError(f"owner_mismatch: {owners}")
-    return distinct.pop()
-
-
-def snapshot_command(uid: int, gid: int, data: Path, dest: Path, names: Sequence[str]) -> list[str]:
-    # Drop privileges for this child only: the orchestrator still needs
-    # docker inspect and root-only directories.
-    return [
-        "/usr/bin/setpriv",
-        f"--reuid={uid}",
-        f"--regid={gid}",
-        "--clear-groups",
-        "/usr/bin/python3",
-        "-m",
-        "hermes_backup.snapshot_cli",
-        "--data",
-        str(data),
-        "--dest",
-        str(dest),
-        *names,
-    ]
-```
-
-Порядок в `run()`: собрать список `data/state.db`, `data/state.db-wal`,
-`data/state.db-shm`, `data/kanban.db`, `data` → `require_single_owner` →
-создать каталог снимков и `os.chown` его на этот UID/GID (это наш staging, а не
-живое дерево) → запустить `snapshot_command` через `subprocess.run` с
-`env={"PYTHONPATH": "/srv/hermes/app"}` → **повторно** проверить владельцев
-исходных БД и sidecar-файлов → при несоответствии `RuntimeError`, архив не
-публикуется. Никакого `chown` по живому дереву.
-
-Тесты в `tests/backup/test_essential_backup.py`:
-
-```python
-def test_snapshot_command_drops_privileges_to_the_file_owner():
-    from hermes_backup.essential_backup import snapshot_command
-
-    argv = snapshot_command(10000, 10000, Path("/srv/hermes/data"), Path("/tmp/s"), ["state.db"])
-    assert argv[:4] == ["/usr/bin/setpriv", "--reuid=10000", "--regid=10000", "--clear-groups"]
-    assert "hermes_backup.snapshot_cli" in argv
-    assert argv[-1] == "state.db"
-
-
-def test_split_ownership_fails_closed(tmp_path):
-    from hermes_backup.essential_backup import require_single_owner
-
-    first = tmp_path / "state.db"
-    first.write_text("x")
-    second = tmp_path / "kanban.db"
-    second.write_text("x")
-
-    import hermes_backup.essential_backup as module
-
-    real_owner_of = module.owner_of
-    module.owner_of = lambda path: (0, 0) if path.name == "kanban.db" else real_owner_of(path)
-    try:
-        with pytest.raises(RuntimeError, match="owner_mismatch"):
-            require_single_owner([first, second])
-    finally:
-        module.owner_of = real_owner_of
-```
-
-В тестовом окружении `setpriv` не запускается: тесты Task 11, которые реально
-собирают архив, вызывают `run(..., snapshot_runner=...)` с подставленным
-раннером, который просто вызывает `snapshot()` напрямую. Сигнатура:
-`run(data, root, *, rsync="rsync", repo=None, snapshot_runner=None)`, где
-`None` означает боевой путь через `setpriv`.
-
-**Второй обязательный критерий: закрыть асимметрию `format_state`.** Сейчас
-`parse_state` проверяет строковые значения регуляркой `_SAFE_STR`, а
-`format_state` пишет их без проверки. `HERMES_IMAGE_REF` и `HERMES_GIT_SHA`
-приходят из вывода `docker inspect` и `git`, то есть извне: значение с
-пробелом или переводом строки сейчас упадёт не при записи, а позже в
-`_self_check`, с невнятной жалобой на неизвестный ключ. Добавить в
-`hermes_backup/state.py`:
+В `INT_KEYS` добавить `"EXCLUDED_SPECIAL_COUNT"`. `format_state` заменить на:
 
 ```python
 def format_state(values: Mapping[str, int | str]) -> str:
@@ -2462,18 +2368,19 @@ def format_state(values: Mapping[str, int | str]) -> str:
     unknown = set(values) - ALL_KEYS
     if unknown:
         raise StateError(f"unknown key: {sorted(unknown)[0]}")
-    for key in STR_KEYS:
+    for key in sorted(STR_KEYS):
         # Values arrive from `docker inspect` and `git`: reject a bad one
         # where it is produced, not three steps later in the self-check.
         if not _SAFE_STR.match(str(values[key])):
             raise StateError(f"{key} has an unsafe value")
-    for key in INT_KEYS:
-        if not isinstance(values[key], int) or isinstance(values[key], bool):
+    for key in sorted(INT_KEYS):
+        if isinstance(values[key], bool) or not isinstance(values[key], int):
             raise StateError(f"{key} expects an integer")
     return "".join(f"{key}={values[key]}\n" for key in sorted(values))
 ```
 
-и тест в `tests/backup/test_state.py`:
+Тесты в `tests/backup/test_state.py`: добавить `"EXCLUDED_SPECIAL_COUNT": 0` в
+фикстуру `VALID` и два теста:
 
 ```python
 def test_format_rejects_an_unsafe_string_value():
@@ -2487,18 +2394,149 @@ def test_format_rejects_a_non_integer_count():
         format_state(dict(VALID, EXPECTED_SKILLS="78"))
 ```
 
-- [ ] **Step 1: Написать падающий тест**
+- [ ] **Step 2: Научить `inventory.py` спецфайлам**
+
+Спецфайлы не доезжают до staging: Task 8 копирует без `-D`, потому что
+`sha256_file` на FIFO повис бы навсегда. Но исчезать молча они не должны.
+Классификация делается по `lstat`, файл при этом не открывается.
+
+```python
+import stat
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ExclusionTotals:
+    files: int
+    specials: int
+
+
+def _kind(path: Path) -> str:
+    """Classify by lstat alone: opening a FIFO would block forever."""
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "special"
+```
+
+`_describe` и `write_inventory` используют `_kind` вместо `path.is_symlink()`:
+запись типа `special` получает `"type": "special"` без размера и без SHA.
+
+`write_exclusions` переписывается так, чтобы возвращать `ExclusionTotals` и
+записывать каждый спецфайл независимо от правил исключения:
+
+```python
+def write_exclusions(source: Path, out: Path) -> ExclusionTotals:
+    """Record what never reached the archive, read from the live tree.
+
+    Specials are recorded whether or not a rule matches them: rsync leaves
+    them behind by design, and an unrecorded loss is exactly what this
+    backup must not produce.
+    """
+    files = specials = 0
+    with out.open("w", encoding="utf-8") as handle:
+        for path, rel in _entries(source):
+            kind = _kind(path)
+            rule = excluded_by(rel)
+            if kind == "special":
+                record = {
+                    "path": rel,
+                    "rule": rule or "special-object",
+                    "type": "special",
+                    "classification": "excluded-special",
+                }
+                specials += 1
+            elif rule is None:
+                continue
+            elif kind == "symlink":
+                record = {
+                    "path": rel,
+                    "rule": rule,
+                    "type": "symlink",
+                    "target": os.readlink(path),
+                    "classification": "excluded-recoverable",
+                }
+                files += 1
+            else:
+                # No SHA here: exclusions describe what was left behind, and
+                # hashing the recoverable bulk is the expensive half.
+                record = {
+                    "path": rel,
+                    "rule": rule,
+                    "type": "file",
+                    "size": path.stat().st_size,
+                    "classification": "excluded-recoverable",
+                }
+                files += 1
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    out.chmod(0o600)
+    return ExclusionTotals(files=files, specials=specials)
+```
+
+Тесты в `tests/backup/test_inventory.py` — поправить два существующих на новый
+тип возврата (`write_exclusions(...).files`) и добавить:
+
+```python
+def test_fifo_is_recorded_as_special_and_never_opened(tmp_path):
+    source = tmp_path / "data"
+    source.mkdir()
+    os.mkfifo(source / "pipe")
+    out = tmp_path / "EXCLUSIONS.jsonl"
+
+    totals = write_exclusions(source, out)
+
+    row = json.loads(out.read_text().splitlines()[0])
+    assert totals.specials == 1
+    assert row["type"] == "special"
+    assert row["classification"] == "excluded-special"
+    assert "sha256" not in row and "size" not in row
+
+
+def test_inventory_does_not_hash_a_special(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    os.mkfifo(staging / "pipe")
+    out = tmp_path / "INVENTORY.jsonl"
+
+    totals = write_inventory(staging, out)
+
+    row = json.loads(out.read_text().splitlines()[0])
+    assert row["type"] == "special"
+    assert "sha256" not in row
+    assert totals.files == 1
+```
+
+#### Оркестратор
+
+- [ ] **Step 3: Написать падающий тест**
 
 ```python
 # tests/backup/test_essential_backup.py
 import json
+import os
 import sqlite3
 import tarfile
+from pathlib import Path
 
 import pytest
 
-from hermes_backup.essential_backup import run
+from hermes_backup.essential_backup import (
+    require_single_owner,
+    run,
+    snapshot_command,
+)
+from hermes_backup.sqlite_snapshot import snapshot
 from hermes_backup.state import parse_state
+
+DEPLOY = Path(__file__).resolve().parents[2] / "deploy" / "beget"
+
+
+def _direct_runner(uid, gid, data, dest, names):
+    """Tests cannot setpriv; take the snapshots in-process instead."""
+    for name in names:
+        snapshot(data / name, dest / name)
 
 
 def _fixture_tree(root):
@@ -2531,9 +2569,13 @@ def _fixture_tree(root):
     return data
 
 
+def _run(data, root, **kwargs):
+    kwargs.setdefault("snapshot_runner", _direct_runner)
+    return run(data, root, **kwargs)
+
+
 def test_publishes_a_directory_with_exactly_five_files(tmp_path):
-    data = _fixture_tree(tmp_path)
-    published = run(data, tmp_path / "essential")
+    published = _run(_fixture_tree(tmp_path), tmp_path / "essential")
 
     assert {item.name for item in published.iterdir()} == {
         "essential.tar.gz",
@@ -2543,23 +2585,23 @@ def test_publishes_a_directory_with_exactly_five_files(tmp_path):
         "SHA256SUMS",
     }
     assert published.name.startswith("daily-")
+    assert published.stat().st_mode & 0o777 == 0o700
 
 
 def test_state_counts_match_the_fixture(tmp_path):
-    data = _fixture_tree(tmp_path)
-    published = run(data, tmp_path / "essential")
+    published = _run(_fixture_tree(tmp_path), tmp_path / "essential")
 
     state = parse_state((published / "STATE").read_text())
     assert state["EXPECTED_SESSIONS"] == 2
     assert state["EXPECTED_SKILLS"] == 1
     assert state["EXPECTED_PLUGINS"] == 1
     assert state["EXPECTED_CRON_JOBS"] == 1
+    assert state["EXCLUDED_SPECIAL_COUNT"] == 0
     assert state["BACKUP_FORMAT_VERSION"] == 1
 
 
 def test_archive_carries_snapshots_and_drops_recoverable_files(tmp_path):
-    data = _fixture_tree(tmp_path)
-    published = run(data, tmp_path / "essential")
+    published = _run(_fixture_tree(tmp_path), tmp_path / "essential")
 
     with tarfile.open(published / "essential.tar.gz") as tar:
         names = set(tar.getnames())
@@ -2570,21 +2612,21 @@ def test_archive_carries_snapshots_and_drops_recoverable_files(tmp_path):
     assert not any("request_dump" in name for name in names)
 
 
-def test_partial_directory_is_removed_when_a_step_fails(tmp_path, monkeypatch):
+def test_fifo_is_counted_in_state_and_never_archived(tmp_path):
     data = _fixture_tree(tmp_path)
-    root = tmp_path / "essential"
+    os.mkfifo(data / "pipe")
 
-    import hermes_backup.essential_backup as module
+    published = _run(data, tmp_path / "essential")
 
-    def boom(*args, **kwargs):
-        raise RuntimeError("snapshot exploded")
-
-    monkeypatch.setattr(module, "snapshot", boom)
-    with pytest.raises(RuntimeError):
-        run(data, root)
-
-    assert not list(root.glob("daily-*"))
-    assert not list(root.glob(".daily-*"))
+    state = parse_state((published / "STATE").read_text())
+    assert state["EXCLUDED_SPECIAL_COUNT"] == 1
+    rows = [
+        json.loads(line)
+        for line in (published / "EXCLUSIONS.jsonl").read_text().splitlines()
+    ]
+    assert any(row["classification"] == "excluded-special" for row in rows)
+    with tarfile.open(published / "essential.tar.gz") as tar:
+        assert "pipe" not in set(tar.getnames())
 
 
 def test_torn_config_yaml_never_reaches_the_archive(tmp_path):
@@ -2592,8 +2634,8 @@ def test_torn_config_yaml_never_reaches_the_archive(tmp_path):
     (data / "config.yaml").write_text("model: [unclosed\n")
     root = tmp_path / "essential"
 
-    with pytest.raises(RuntimeError):
-        run(data, root)
+    with pytest.raises(RuntimeError, match="config_yaml"):
+        _run(data, root)
 
     assert not list(root.glob("daily-*"))
     assert not list(root.glob(".daily-*"))
@@ -2603,30 +2645,183 @@ def test_empty_config_yaml_is_rejected(tmp_path):
     data = _fixture_tree(tmp_path)
     (data / "config.yaml").write_text("")
     with pytest.raises(RuntimeError, match="config_yaml"):
-        run(data, tmp_path / "essential")
+        _run(data, tmp_path / "essential")
+
+
+def test_a_failing_snapshot_runner_publishes_nothing(tmp_path):
+    data = _fixture_tree(tmp_path)
+    root = tmp_path / "essential"
+
+    def broken(uid, gid, source, dest, names):
+        raise RuntimeError("snapshot_failed (1): setpriv exploded")
+
+    with pytest.raises(RuntimeError, match="snapshot_failed"):
+        _run(data, root, snapshot_runner=broken)
+
+    assert not list(root.glob("daily-*"))
+    assert not list(root.glob(".daily-*"))
+
+
+def test_a_silent_snapshot_runner_is_caught(tmp_path):
+    """A runner that exits zero without producing files must not pass."""
+    data = _fixture_tree(tmp_path)
+    root = tmp_path / "essential"
+
+    with pytest.raises(RuntimeError, match="snapshot_missing"):
+        _run(data, root, snapshot_runner=lambda *args: None)
+
+    assert not list(root.glob("daily-*"))
 
 
 def test_previous_backup_survives_a_failed_run(tmp_path, monkeypatch):
     data = _fixture_tree(tmp_path)
     root = tmp_path / "essential"
-    first = run(data, root)
+    first = _run(data, root)
 
     import hermes_backup.essential_backup as module
 
-    monkeypatch.setattr(module, "create", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(
+        module, "create", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+    )
     with pytest.raises(RuntimeError):
-        run(data, root)
+        _run(data, root)
 
     assert first.exists()
     assert (first / "SHA256SUMS").exists()
+
+
+def test_missing_database_fails_before_anything_is_copied(tmp_path):
+    data = _fixture_tree(tmp_path)
+    (data / "kanban.db").unlink()
+    root = tmp_path / "essential"
+
+    with pytest.raises(RuntimeError, match="missing_database"):
+        _run(data, root)
+
+    assert not root.exists() or not list(root.glob(".daily-*"))
+
+
+def test_split_ownership_fails_closed(tmp_path, monkeypatch):
+    import hermes_backup.essential_backup as module
+
+    first = tmp_path / "state.db"
+    first.write_text("x")
+    second = tmp_path / "kanban.db"
+    second.write_text("x")
+
+    real = module.owner_of
+    monkeypatch.setattr(
+        module,
+        "owner_of",
+        lambda path: (0, 0) if path.name == "kanban.db" else real(path),
+    )
+    with pytest.raises(RuntimeError, match="owner_mismatch"):
+        require_single_owner([first, second])
+
+
+def test_snapshot_command_drops_privileges_to_the_file_owner():
+    argv = snapshot_command(
+        10000, 10000, Path("/srv/hermes/data"), Path("/tmp/s"), ["state.db"]
+    )
+    assert argv[:4] == [
+        "/usr/bin/setpriv",
+        "--reuid=10000",
+        "--regid=10000",
+        "--clear-groups",
+    ]
+    assert "hermes_backup.snapshot_cli" in argv
+    assert argv[-1] == "state.db"
+
+
+def test_publishing_twice_in_one_second_does_not_overwrite(tmp_path, monkeypatch):
+    """Two runs in the same second must not silently replace each other."""
+    data = _fixture_tree(tmp_path)
+    root = tmp_path / "essential"
+    import hermes_backup.essential_backup as module
+
+    frozen = "20260726T031500Z"
+    monkeypatch.setattr(module, "_stamp", lambda: frozen)
+    _run(data, root)
+    with pytest.raises(RuntimeError, match="already_published"):
+        _run(data, root)
+
+
+def test_tree_bytes_does_not_follow_symlinks(tmp_path):
+    import hermes_backup.essential_backup as module
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "big.bin").write_bytes(b"0" * 4096)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "small.txt").write_bytes(b"0" * 10)
+    (tree / "link").symlink_to(outside, target_is_directory=True)
+
+    assert module._tree_bytes(tree) == 10
+
+
+def test_service_treats_lock_skip_as_success():
+    unit = (DEPLOY / "systemd" / "hermes-essential-backup.service").read_text()
+    assert "SuccessExitStatus=75" in unit
+    assert "UMask=0077" in unit
+
+
+def test_wrapper_takes_the_shared_lock():
+    wrapper = (DEPLOY / "hermes_essential_backup.sh").read_text()
+    assert "/run/lock/hermes-backup.lock" in wrapper
+    assert "flock -n 9" in wrapper
 ```
 
-- [ ] **Step 2: Прогнать тест и убедиться, что он падает**
+- [ ] **Step 4: Прогнать тест и убедиться, что он падает**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_essential_backup.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'hermes_backup.essential_backup'`
 
-- [ ] **Step 3: Реализовать модуль**
+- [ ] **Step 5: Реализовать `snapshot_cli.py`**
+
+```python
+#!/usr/bin/env python3
+# hermes_backup/snapshot_cli.py
+"""Snapshot databases into a directory.
+
+Runs as a separate process so the orchestrator can drop privileges for
+this step alone: the databases belong to the Hermes uid, and a root
+connection that creates -wal/-shm would lock Hermes out of its own data.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from hermes_backup.sqlite_snapshot import SnapshotError, integrity_check, snapshot
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--dest", type=Path, required=True)
+    parser.add_argument("names", nargs="+")
+    args = parser.parse_args(argv)
+    args.dest.mkdir(parents=True, exist_ok=True)
+    try:
+        for name in args.names:
+            target = args.dest / name
+            snapshot(args.data / name, target)
+            integrity_check(target)
+    except SnapshotError as error:
+        print(f"hermes_snapshot_FAILED {error}", file=sys.stderr)
+        return 1
+    print(f"hermes_snapshot_OK count={len(args.names)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 6: Реализовать `essential_backup.py`**
 
 ```python
 # hermes_backup/essential_backup.py
@@ -2640,32 +2835,111 @@ then the archive, then a self-check, and only then the atomic publish.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from hermes_backup import config
-from hermes_backup.archive import create
+from hermes_backup.archive import create, validate
 from hermes_backup.config import DEFAULTS, BackupSettings, load_settings
 from hermes_backup.counters import count_cron_jobs, count_plugins, count_sessions, count_skills
 from hermes_backup.hashing import atomic_write_text, sha256_file, write_sha256sums
 from hermes_backup.inventory import write_exclusions, write_inventory
-from hermes_backup.locks import LockBusy
 from hermes_backup.sqlite_snapshot import (
     foreign_key_check,
     integrity_check,
     page_count,
-    snapshot,
     user_version,
 )
 from hermes_backup.staging import stabilized_copy
-from hermes_backup.state import format_state
+from hermes_backup.state import format_state, parse_state
 from hermes_backup.status import status_line, write_status
 
-MIN_FREE_BYTES = 2 * 1024**3
+APP_ROOT = Path("/srv/hermes/app")
+DATABASES = ("state.db", "kanban.db")
+SIDECARS = ("-wal", "-shm")
 MAX_STAGING_BYTES = 4 * 1024**3
+FREE_SPACE_MARGIN = 512 * 1024**2
+
+
+def _stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def owner_of(path: Path) -> tuple[int, int]:
+    info = path.lstat()
+    return info.st_uid, info.st_gid
+
+
+def database_paths(data: Path) -> list[Path]:
+    """Every artefact whose owner must agree, main databases required."""
+    paths = [data]
+    for name in DATABASES:
+        main = data / name
+        if not main.exists():
+            raise RuntimeError(f"missing_database: {main}")
+        paths.append(main)
+        paths.extend(data / f"{name}{suffix}" for suffix in SIDECARS)
+    return paths
+
+
+def require_single_owner(paths: Sequence[Path]) -> tuple[int, int]:
+    """One owner for the whole set, or we stop.
+
+    A split owner means a previous run already wrote as the wrong user;
+    chowning a live tree under a running Hermes would be worse than
+    refusing to back up.
+    """
+    owners = {path: owner_of(path) for path in paths if path.exists()}
+    distinct = set(owners.values())
+    if len(distinct) != 1:
+        raise RuntimeError(f"owner_mismatch: {owners}")
+    return distinct.pop()
+
+
+def snapshot_command(
+    uid: int, gid: int, data: Path, dest: Path, names: Sequence[str]
+) -> list[str]:
+    # Drop privileges for this child only: the orchestrator still needs
+    # docker inspect and root-only directories.
+    return [
+        "/usr/bin/setpriv",
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "/usr/bin/python3",
+        "-m",
+        "hermes_backup.snapshot_cli",
+        "--data",
+        str(data),
+        "--dest",
+        str(dest),
+        *names,
+    ]
+
+
+def _setpriv_runner(
+    uid: int, gid: int, data: Path, dest: Path, names: Sequence[str]
+) -> None:
+    result = subprocess.run(
+        snapshot_command(uid, gid, data, dest, names),
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PYTHONPATH": str(APP_ROOT), "PATH": "/usr/bin:/bin"},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"snapshot_failed ({result.returncode}): {result.stderr.strip()}"
+        )
 
 
 def _git_sha(repo: Path) -> str:
@@ -2689,7 +2963,30 @@ def _image(field: str) -> str:
 
 
 def _tree_bytes(root: Path) -> int:
-    return sum(item.stat().st_size for item in root.rglob("*") if item.is_file())
+    """Size of regular files only, never following a symlink out of the tree."""
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
+        for name in filenames:
+            info = (base / name).lstat()
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    return total
+
+
+def _validate_structured(staging: Path) -> None:
+    """A file caught mid-write must never reach the archive.
+
+    The lock stops other backups, not Hermes, so staging can hold a
+    half-written config; parsing it here is the last gate before publish.
+    """
+    try:
+        parsed = yaml.safe_load((staging / "config.yaml").read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise RuntimeError(f"config_yaml_unparsable: {error}") from error
+    if not parsed:
+        raise RuntimeError("config_yaml_empty")
 
 
 def run(
@@ -2699,39 +2996,69 @@ def run(
     rsync: str = "rsync",
     repo: Path | None = None,
     settings: BackupSettings | None = None,
+    snapshot_runner=None,
 ) -> Path:
     settings = settings or BackupSettings(**DEFAULTS)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    runner = snapshot_runner or _setpriv_runner
+    paths = database_paths(data)
+    uid, gid = require_single_owner(paths)
+
+    stamp = _stamp()
     root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
     partial = root / f".daily-{stamp}.partial"
     published = root / f"daily-{stamp}"
+    if published.exists():
+        # Two runs inside one second would otherwise overwrite each other.
+        raise RuntimeError(f"already_published: {published}")
+
+    source_bytes = _tree_bytes(data)
+    free = shutil.disk_usage(root).free
+    # Staging holds a copy and the archive is written beside it.
+    if free < source_bytes * 2 + FREE_SPACE_MARGIN:
+        raise RuntimeError(
+            f"insufficient_disk_space: free={free} needed={source_bytes * 2 + FREE_SPACE_MARGIN}"
+        )
+
     staging = partial / "staging"
-
-    if shutil.disk_usage(root).free < MIN_FREE_BYTES:
-        raise RuntimeError("insufficient_disk_space")
-
+    snapshots = partial / "snapshots"
     if partial.exists():
         shutil.rmtree(partial)
-    partial.mkdir(parents=True)
+    partial.mkdir(parents=True, mode=0o700)
     try:
         stabilized_copy(data, staging, rsync=rsync)
-        if _tree_bytes(staging) > MAX_STAGING_BYTES:
-            raise RuntimeError("staging_too_large")
+        staging_bytes = _tree_bytes(staging)
+        if staging_bytes > MAX_STAGING_BYTES:
+            raise RuntimeError(f"staging_too_large: {staging_bytes}")
+        if shutil.disk_usage(root).free < staging_bytes + FREE_SPACE_MARGIN:
+            raise RuntimeError("insufficient_disk_space_for_archive")
         _validate_structured(staging)
 
+        snapshots.mkdir(mode=0o700)
+        if os.geteuid() == 0:
+            os.chown(snapshots, uid, gid)
+        runner(uid, gid, data, snapshots, DATABASES)
+        missing = [name for name in DATABASES if not (snapshots / name).exists()]
+        if missing:
+            raise RuntimeError(f"snapshot_missing: {missing}")
+        # The child touched the live databases: prove it left them alone.
+        require_single_owner(paths)
+
         databases = {}
-        for name in ("state.db", "kanban.db"):
-            snapshot(data / name, staging / name)
-            integrity_check(staging / name)
-            foreign_key_check(staging / name)
+        for name in DATABASES:
+            source = snapshots / name
+            integrity_check(source)
+            foreign_key_check(source)
             databases[name] = {
-                "sha256": sha256_file(staging / name),
-                "page_count": page_count(staging / name),
-                "user_version": user_version(staging / name),
+                "sha256": sha256_file(source),
+                "page_count": page_count(source),
+                "user_version": user_version(source),
             }
+            shutil.move(str(source), str(staging / name))
+        shutil.rmtree(snapshots)
 
         totals = write_inventory(staging, partial / "INVENTORY.jsonl")
-        write_exclusions(data, partial / "EXCLUSIONS.jsonl")
+        exclusions = write_exclusions(data, partial / "EXCLUSIONS.jsonl")
 
         atomic_write_text(
             partial / "STATE",
@@ -2740,7 +3067,7 @@ def run(
                     "BACKUP_FORMAT_VERSION": 1,
                     "CREATED_AT": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "SOURCE_HOST": "aeza",
-                    "HERMES_GIT_SHA": _git_sha(repo or Path("/srv/hermes/app")),
+                    "HERMES_GIT_SHA": _git_sha(repo or APP_ROOT),
                     "HERMES_IMAGE_ID": _image("{{.Image}}"),
                     "HERMES_IMAGE_REF": _image("{{index .Config.Image}}"),
                     "STATE_DB_SHA256": databases["state.db"]["sha256"],
@@ -2756,6 +3083,7 @@ def run(
                     "ESSENTIAL_FILE_COUNT": totals.files,
                     "ESSENTIAL_TOTAL_BYTES": totals.total_bytes,
                     "UNCLASSIFIED_FILE_COUNT": totals.unclassified,
+                    "EXCLUDED_SPECIAL_COUNT": exclusions.specials,
                 }
             ),
         )
@@ -2772,28 +3100,18 @@ def run(
     return published
 
 
-def _validate_structured(staging: Path) -> None:
-    """A file caught mid-write must never reach the archive.
-
-    The lock stops other backups, not Hermes, so staging can hold a
-    half-written config; parsing it here is the last gate before publish.
-    """
-    import yaml
-
-    try:
-        parsed = yaml.safe_load((staging / "config.yaml").read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
-        raise RuntimeError(f"config_yaml_unparsable: {error}") from error
-    if not parsed:
-        raise RuntimeError("config_yaml_empty")
-
-
 def _self_check(directory: Path) -> None:
-    from hermes_backup.archive import validate
-    from hermes_backup.state import parse_state
-
     validate(directory / "essential.tar.gz")
-    parse_state((directory / "STATE").read_text(encoding="utf-8"))
+    state = parse_state((directory / "STATE").read_text(encoding="utf-8"))
+    recorded = sum(
+        1
+        for line in (directory / "EXCLUSIONS.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["classification"] == "excluded-special"
+    )
+    if recorded != state["EXCLUDED_SPECIAL_COUNT"]:
+        raise RuntimeError(
+            f"special_count_mismatch: STATE={state['EXCLUDED_SPECIAL_COUNT']} file={recorded}"
+        )
     for line in (directory / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
         digest, name = line.split("  ", 1)
         if sha256_file(directory / name) != digest:
@@ -2801,8 +3119,10 @@ def _self_check(directory: Path) -> None:
 
 
 def _prune(root: Path, keep: int) -> None:
+    if keep < 1:
+        return
     daily = sorted(item for item in root.glob("daily-*") if item.is_dir())
-    for stale in daily[: max(0, len(daily) - keep)] if keep >= 1 else []:
+    for stale in daily[: max(0, len(daily) - keep)]:
         shutil.rmtree(stale, ignore_errors=True)
 
 
@@ -2815,15 +3135,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         published = run(args.data, args.root, settings=load_settings(args.config))
-    except LockBusy as error:
-        print(status_line("essential_backup", "SKIPPED", f"locked {error}"))
-        return 75
     except BaseException as error:  # noqa: BLE001 — status must always be emitted
         write_status(args.status_dir, "essential_backup", "FAILED", reason=str(error))
         print(status_line("essential_backup", "FAILED", str(error)), file=sys.stderr)
         return 1
-    write_status(args.status_dir, "essential_backup", "OK", backup_path=str(published))
-    print(status_line("essential_backup", "OK", f"path={published}"))
+    state = parse_state((published / "STATE").read_text(encoding="utf-8"))
+    write_status(
+        args.status_dir, "essential_backup", "OK", backup_path=str(published)
+    )
+    print(
+        status_line(
+            "essential_backup",
+            "OK",
+            f"path={published} files={state['ESSENTIAL_FILE_COUNT']} "
+            f"unclassified={state['UNCLASSIFIED_FILE_COUNT']} "
+            f"specials={state['EXCLUDED_SPECIAL_COUNT']}",
+        )
+    )
     return 0
 
 
@@ -2831,12 +3159,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 4: Прогнать тесты**
-
-Run: `.venv/bin/python -m pytest tests/backup/test_essential_backup.py -v`
-Expected: PASS, 7 тестов.
-
-- [ ] **Step 5: Написать обёртку и systemd-юниты**
+- [ ] **Step 7: Написать обёртку и systemd-юниты**
 
 ```bash
 # deploy/beget/hermes_essential_backup.sh
@@ -2845,6 +3168,7 @@ Expected: PASS, 7 тестов.
 # where it is covered by pytest. Takes the shared backup lock so the full
 # archive can never run at the same time.
 set -euo pipefail
+umask 0077
 
 APP=/srv/hermes/app
 LOCK=/run/lock/hermes-backup.lock
@@ -2866,6 +3190,7 @@ After=docker.service
 
 [Service]
 Type=oneshot
+UMask=0077
 ExecStart=/srv/hermes/app/deploy/beget/hermes_essential_backup.sh
 SuccessExitStatus=75
 ```
@@ -2883,37 +3208,24 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-- [ ] **Step 6: Проверить юниты тестом**
+- [ ] **Step 8: Прогнать тесты**
 
-```python
-# добавить в tests/backup/test_essential_backup.py
-from pathlib import Path
+Run: `.venv/bin/python -m pytest tests/backup -v`
+Expected: PASS — 16 тестов Task 11 плюс весь ранее написанный набор с учётом
+правок в `test_state.py` и `test_inventory.py`.
 
-DEPLOY = Path(__file__).resolve().parents[2] / "deploy" / "beget"
-
-
-def test_service_treats_lock_skip_as_success():
-    unit = (DEPLOY / "systemd" / "hermes-essential-backup.service").read_text()
-    assert "SuccessExitStatus=75" in unit
-
-
-def test_wrapper_takes_the_shared_lock():
-    wrapper = (DEPLOY / "hermes_essential_backup.sh").read_text()
-    assert "/run/lock/hermes-backup.lock" in wrapper
-    assert "flock -n 9" in wrapper
-```
-
-Run: `.venv/bin/python -m pytest tests/backup/test_essential_backup.py -v`
-Expected: PASS, 9 тестов.
-
-- [ ] **Step 7: Коммит**
+- [ ] **Step 9: Коммит**
 
 ```bash
 chmod +x deploy/beget/hermes_essential_backup.sh
-git add hermes_backup/essential_backup.py deploy/beget/hermes_essential_backup.sh \
-        deploy/beget/systemd/ tests/backup/test_essential_backup.py
+git add hermes_backup/essential_backup.py hermes_backup/snapshot_cli.py \
+        hermes_backup/state.py hermes_backup/inventory.py \
+        deploy/beget/hermes_essential_backup.sh deploy/beget/systemd/ \
+        tests/backup/test_essential_backup.py tests/backup/test_state.py \
+        tests/backup/test_inventory.py
 git commit -m "feat(backup): publish the essential backup atomically on Aeza"
 ```
+
 
 ---
 
@@ -2922,10 +3234,11 @@ git commit -m "feat(backup): publish the essential backup atomically on Aeza"
 **Files:**
 - Modify: `deploy/beget/backup.sh`
 - Create: `deploy/beget/systemd/hermes-full-backup.service`, `deploy/beget/systemd/hermes-full-backup.timer`
+- Reuse: `hermes_backup/snapshot_cli.py` — создан в Task 11, здесь только вызывается
 - Test: `tests/backup/test_full_backup_script.py`
 
 **Interfaces:**
-- Consumes: `hermes_backup.sqlite_snapshot` через `python3 -m hermes_backup.snapshot_cli`.
+- Consumes: `hermes_backup.snapshot_cli`, созданный в Task 11.
 - Produces: изменённый `backup.sh`, который берёт `/run/lock/hermes-backup.lock`, исключает `state.db*`/`kanban.db*` и добавляет собственные снимки.
 
 - [ ] **Step 1: Написать падающий тест**
@@ -2963,7 +3276,9 @@ def test_retention_floor_is_preserved():
 
 
 def test_unit_treats_lock_skip_as_success():
-    assert "SuccessExitStatus=75" in UNIT.read_text()
+    unit = UNIT.read_text()
+    assert "SuccessExitStatus=75" in unit
+    assert "UMask=0077" in unit
 ```
 
 - [ ] **Step 2: Прогнать тест и убедиться, что он падает**
@@ -2971,45 +3286,7 @@ def test_unit_treats_lock_skip_as_success():
 Run: `.venv/bin/python -m pytest tests/backup/test_full_backup_script.py -v`
 Expected: FAIL — ни исключений, ни лока в скрипте пока нет.
 
-- [ ] **Step 3: Добавить CLI для снимков**
-
-```python
-# hermes_backup/snapshot_cli.py
-"""Snapshot databases into a directory: used by the full-archive script."""
-
-from __future__ import annotations
-
-import argparse
-import sys
-from pathlib import Path
-
-from hermes_backup.sqlite_snapshot import SnapshotError, integrity_check, snapshot
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=Path, required=True)
-    parser.add_argument("--dest", type=Path, required=True)
-    parser.add_argument("names", nargs="+")
-    args = parser.parse_args(argv)
-    args.dest.mkdir(parents=True, exist_ok=True)
-    try:
-        for name in args.names:
-            target = args.dest / name
-            snapshot(args.data / name, target)
-            integrity_check(target)
-    except SnapshotError as error:
-        print(f"hermes_snapshot_FAILED {error}", file=sys.stderr)
-        return 1
-    print(f"hermes_snapshot_OK count={len(args.names)}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-- [ ] **Step 4: Изменить `backup.sh`**
+- [ ] **Step 3: Изменить `backup.sh`**
 
 Заменить блок создания архива (строки 21–48 текущего файла) на:
 
@@ -3050,7 +3327,7 @@ set -e
 остаётся без изменений; заменить финальные строки статуса на
 `echo "hermes_full_backup_OK: $archive"`.
 
-- [ ] **Step 5: Написать юниты**
+- [ ] **Step 4: Написать юниты**
 
 ```ini
 # deploy/beget/systemd/hermes-full-backup.service
@@ -3060,6 +3337,7 @@ After=docker.service
 
 [Service]
 Type=oneshot
+UMask=0077
 ExecStart=/srv/hermes/app/deploy/beget/backup.sh
 SuccessExitStatus=75
 ```
@@ -3077,16 +3355,16 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-- [ ] **Step 6: Прогнать тесты**
+- [ ] **Step 5: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_full_backup_script.py -v`
 Expected: PASS, 5 тестов.
 
-- [ ] **Step 7: Коммит**
+- [ ] **Step 6: Коммит**
 
 ```bash
 git add deploy/beget/backup.sh deploy/beget/systemd/hermes-full-backup.* \
-        hermes_backup/snapshot_cli.py tests/backup/test_full_backup_script.py
+        tests/backup/test_full_backup_script.py
 git commit -m "fix(backup): stop tarring live SQLite files in the full archive"
 ```
 
