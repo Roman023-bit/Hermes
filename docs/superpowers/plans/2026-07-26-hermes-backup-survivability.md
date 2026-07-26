@@ -5480,6 +5480,11 @@ git commit -m "feat(backup): summarize backup health from status files"
 - Consumes: ничего.
 - Produces: `scripts/state_parser.py --key EXPECTED_DOCUMENTS <file>` печатает значение и завершается ненулевым кодом на неизвестном ключе или небезопасном значении.
 
+**Обязательный критерий приёмки: валидируется весь `STATE`, а не одна строка.**
+Неизвестный ключ, повтор, malformed-строка и отсутствие любого из трёх
+обязательных ключей отвергаются — даже если запрошен другой ключ. Иначе
+вредоносное значение спокойно доедет в файле рядом с тем, что мы читаем.
+
 - [ ] **Step 1: Написать падающий тест**
 
 ```python
@@ -5495,40 +5500,87 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PARSER = REPO / "scripts" / "state_parser.py"
 DRILL = REPO / "scripts" / "restore_drill.sh"
+VALID = "EXPECTED_DOCUMENTS=96\nEXPECTED_CHUNKS=621\nEXPECTED_POINTS=621\n"
 
 
 def _run(args, **kwargs):
-    return subprocess.run([sys.executable, str(PARSER), *args], capture_output=True, text=True, **kwargs)
+    return subprocess.run(
+        [sys.executable, str(PARSER), *args], capture_output=True, text=True, **kwargs
+    )
 
 
 def test_drill_never_sources_state():
     text = DRILL.read_text()
-    assert "source \"$latest/STATE\"" not in text
+    assert 'source "$latest/STATE"' not in text
     assert "source $latest/STATE" not in text
     assert "state_parser.py" in text
 
 
 def test_parser_returns_a_whitelisted_value(tmp_path):
     state = tmp_path / "STATE"
-    state.write_text("EXPECTED_DOCUMENTS=96\nEXPECTED_CHUNKS=621\nEXPECTED_POINTS=621\n")
+    state.write_text(VALID)
     result = _run(["--key", "EXPECTED_DOCUMENTS", str(state)])
     assert result.returncode == 0
     assert result.stdout.strip() == "96"
 
 
-def test_parser_rejects_unknown_key(tmp_path):
+def test_parser_rejects_unknown_key_request(tmp_path):
     state = tmp_path / "STATE"
-    state.write_text("EVIL=1\n")
+    state.write_text(VALID)
     assert _run(["--key", "EVIL", str(state)]).returncode != 0
+
+
+def test_an_unknown_key_anywhere_in_the_file_is_rejected(tmp_path):
+    """The whole file is validated: a hostile line next to the one we read
+    must not travel along unnoticed."""
+    state = tmp_path / "STATE"
+    state.write_text(VALID + "EVIL=$(rm -rf /)\n")
+    result = _run(["--key", "EXPECTED_DOCUMENTS", str(state)])
+    assert result.returncode != 0
+    assert "unknown key" in result.stderr
 
 
 def test_command_substitution_is_never_executed(tmp_path):
     canary = tmp_path / "canary"
     canary.write_text("intact")
     state = tmp_path / "STATE"
-    state.write_text(f"EXPECTED_DOCUMENTS=$(rm -f {canary})\n")
+    state.write_text(f"EXPECTED_DOCUMENTS=$(rm -f {canary})\nEXPECTED_CHUNKS=1\nEXPECTED_POINTS=1\n")
     assert _run(["--key", "EXPECTED_DOCUMENTS", str(state)]).returncode != 0
     assert canary.read_text() == "intact"
+
+
+def test_duplicate_key_is_rejected(tmp_path):
+    state = tmp_path / "STATE"
+    state.write_text(VALID + "EXPECTED_POINTS=999\n")
+    result = _run(["--key", "EXPECTED_POINTS", str(state)])
+    assert result.returncode != 0
+    assert "duplicate" in result.stderr
+
+
+def test_a_missing_required_key_is_rejected(tmp_path):
+    state = tmp_path / "STATE"
+    state.write_text("EXPECTED_DOCUMENTS=96\nEXPECTED_CHUNKS=621\n")
+    result = _run(["--key", "EXPECTED_DOCUMENTS", str(state)])
+    assert result.returncode != 0
+    assert "missing" in result.stderr
+
+
+def test_a_malformed_line_is_rejected(tmp_path):
+    state = tmp_path / "STATE"
+    state.write_text(VALID + "just-some-noise\n")
+    assert _run(["--key", "EXPECTED_DOCUMENTS", str(state)]).returncode != 0
+
+
+def test_a_non_integer_value_is_rejected(tmp_path):
+    state = tmp_path / "STATE"
+    state.write_text("EXPECTED_DOCUMENTS=many\nEXPECTED_CHUNKS=621\nEXPECTED_POINTS=621\n")
+    assert _run(["--key", "EXPECTED_DOCUMENTS", str(state)]).returncode != 0
+
+
+def test_corrupted_bytes_are_rejected(tmp_path):
+    state = tmp_path / "STATE"
+    state.write_bytes(b"EXPECTED_DOCUMENTS=96\n\xff\xfe\n")
+    assert _run(["--key", "EXPECTED_DOCUMENTS", str(state)]).returncode != 0
 ```
 
 - [ ] **Step 2: Прогнать тест и убедиться, что он падает**
@@ -5544,7 +5596,9 @@ Expected: FAIL — `scripts/state_parser.py` не существует.
 """Read one whitelisted key from a backup STATE file.
 
 STATE lives inside the backup directory, so it is untrusted input and is
-never sourced by the shell.
+never sourced by the shell. The whole file is validated, not just the
+requested line: a hostile value sitting next to the one we want must not
+travel along unnoticed.
 """
 
 from __future__ import annotations
@@ -5554,8 +5608,34 @@ import re
 import sys
 from pathlib import Path
 
-ALLOWED = {"EXPECTED_DOCUMENTS", "EXPECTED_CHUNKS", "EXPECTED_POINTS"}
+REQUIRED = ("EXPECTED_DOCUMENTS", "EXPECTED_CHUNKS", "EXPECTED_POINTS")
 INTEGER = re.compile(r"\A[0-9]+\Z")
+
+
+class StateError(ValueError):
+    """STATE is malformed, incomplete, or carries an unexpected key."""
+
+
+def parse_state(text: str) -> dict[str, int]:
+    parsed: dict[str, int] = {}
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            raise StateError(f"line {number}: expected KEY=VALUE")
+        if key not in REQUIRED:
+            raise StateError(f"line {number}: unknown key {key!r}")
+        if key in parsed:
+            raise StateError(f"line {number}: duplicate key {key!r}")
+        if not INTEGER.match(value):
+            raise StateError(f"line {number}: {key} expects an integer")
+        parsed[key] = int(value)
+    missing = set(REQUIRED) - set(parsed)
+    if missing:
+        raise StateError(f"missing key: {sorted(missing)[0]}")
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5564,20 +5644,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("path", type=Path)
     args = parser.parse_args(argv)
 
-    if args.key not in ALLOWED:
+    if args.key not in REQUIRED:
         print(f"state_parser_FAILED unknown key {args.key}", file=sys.stderr)
         return 2
-    for raw in args.path.read_text(encoding="utf-8").splitlines():
-        key, separator, value = raw.strip().partition("=")
-        if not separator or key != args.key:
-            continue
-        if not INTEGER.match(value):
-            print(f"state_parser_FAILED {key} is not an integer", file=sys.stderr)
-            return 2
-        print(value)
-        return 0
-    print(f"state_parser_FAILED missing key {args.key}", file=sys.stderr)
-    return 2
+    try:
+        values = parse_state(args.path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as error:
+        print(f"state_parser_FAILED unreadable: {error}", file=sys.stderr)
+        return 2
+    except StateError as error:
+        print(f"state_parser_FAILED {error}", file=sys.stderr)
+        return 2
+    print(values[args.key])
+    return 0
 
 
 if __name__ == "__main__":
@@ -5590,30 +5669,33 @@ if __name__ == "__main__":
 
 ```bash
 # STATE comes from the backup directory: parse it, never execute it.
-EXPECTED_DOCUMENTS="$(python3 "$ROOT/app/scripts/state_parser.py" --key EXPECTED_DOCUMENTS "$latest/STATE")"
-EXPECTED_CHUNKS="$(python3 "$ROOT/app/scripts/state_parser.py" --key EXPECTED_CHUNKS "$latest/STATE")"
-EXPECTED_POINTS="$(python3 "$ROOT/app/scripts/state_parser.py" --key EXPECTED_POINTS "$latest/STATE")"
+PARSER="$ROOT/app/scripts/state_parser.py"
+EXPECTED_DOCUMENTS="$(python3 "$PARSER" --key EXPECTED_DOCUMENTS "$latest/STATE")"
+EXPECTED_CHUNKS="$(python3 "$PARSER" --key EXPECTED_CHUNKS "$latest/STATE")"
+EXPECTED_POINTS="$(python3 "$PARSER" --key EXPECTED_POINTS "$latest/STATE")"
 ```
 
-- [ ] **Step 5: Прогнать тесты**
+- [ ] **Step 5: Проверить синтаксис и прогнать тесты**
 
-Run: `cd /Users/romanmizanov/Documents/BD/knowledge-factory && uv run pytest tests/test_restore_drill_state.py -v`
-Expected: PASS, 4 теста.
+```bash
+cd /Users/romanmizanov/Documents/BD/knowledge-factory
+bash -n scripts/restore_drill.sh
+uv run pytest tests/test_restore_drill_state.py -v
+uv run pytest -q
+```
 
-- [ ] **Step 6: Прогнать весь набор KF**
+Expected: `bash -n` молчит; 10 новых тестов проходят; полный набор — 219 passed,
+1 skipped (209 прежних + 10 новых).
 
-Run: `cd /Users/romanmizanov/Documents/BD/knowledge-factory && uv run pytest -q`
-Expected: PASS — 213 passed, 1 skipped (209 прежних + 4 новых).
+- [ ] **Step 6: Локальный коммит**
 
-- [ ] **Step 7: Коммит**
+На Aeza пока не разворачивать: установка исправленного скрипта входит в Task 18.
 
 ```bash
 cd /Users/romanmizanov/Documents/BD/knowledge-factory
 git add scripts/state_parser.py scripts/restore_drill.sh tests/test_restore_drill_state.py
 git commit -m "fix(restore): parse STATE instead of sourcing it as root"
 ```
-
----
 
 ### Task 17: Knowledge Factory — FileVault-гейт и общий сетевой лок
 
