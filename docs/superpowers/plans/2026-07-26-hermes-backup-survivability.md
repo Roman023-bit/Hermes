@@ -2371,7 +2371,10 @@ def format_state(values: Mapping[str, int | str]) -> str:
     for key in sorted(STR_KEYS):
         # Values arrive from `docker inspect` and `git`: reject a bad one
         # where it is produced, not three steps later in the self-check.
-        if not _SAFE_STR.match(str(values[key])):
+        # str() is deliberately not applied — a number here means the
+        # caller mixed up its keys, and coercion would hide that.
+        value = values[key]
+        if not isinstance(value, str) or not _SAFE_STR.match(value):
             raise StateError(f"{key} has an unsafe value")
     for key in sorted(INT_KEYS):
         if isinstance(values[key], bool) or not isinstance(values[key], int):
@@ -2392,6 +2395,12 @@ def test_format_rejects_an_unsafe_string_value():
 def test_format_rejects_a_non_integer_count():
     with pytest.raises(StateError, match="EXPECTED_SKILLS"):
         format_state(dict(VALID, EXPECTED_SKILLS="78"))
+
+
+def test_format_rejects_a_number_where_a_string_belongs():
+    """A bare 123 means the caller mixed up keys; coercion would hide it."""
+    with pytest.raises(StateError, match="HERMES_GIT_SHA"):
+        format_state(dict(VALID, HERMES_GIT_SHA=123))
 ```
 
 - [ ] **Step 2: Научить `inventory.py` спецфайлам**
@@ -2719,6 +2728,59 @@ def test_split_ownership_fails_closed(tmp_path, monkeypatch):
         require_single_owner([first, second])
 
 
+def test_snapshot_child_can_traverse_the_partial_directory(tmp_path, monkeypatch):
+    """A 0700 root:root parent would deny the unprivileged child."""
+    import stat as stat_module
+
+    import hermes_backup.essential_backup as module
+
+    chowns: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        module.os,
+        "chown",
+        lambda path, uid, gid: chowns.append((Path(path).name, uid, gid)),
+    )
+    seen: dict[str, int] = {}
+
+    def spy_runner(uid, gid, data, dest, names):
+        seen["partial"] = stat_module.S_IMODE(dest.parent.stat().st_mode)
+        seen["snapshots"] = stat_module.S_IMODE(dest.stat().st_mode)
+        _direct_runner(uid, gid, data, dest, names)
+
+    published = _run(
+        _fixture_tree(tmp_path), tmp_path / "essential", snapshot_runner=spy_runner
+    )
+
+    assert seen["partial"] == 0o710
+    assert seen["snapshots"] == 0o700
+    assert any(name.startswith(".daily-") for name, _, _ in chowns)
+    # The traversal grant must not survive the snapshot step.
+    assert published.stat().st_mode & 0o777 == 0o700
+
+
+def test_traversal_is_revoked_even_when_the_snapshot_fails(tmp_path, monkeypatch):
+    import hermes_backup.essential_backup as module
+
+    revoked: list[str] = []
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(module.os, "chown", lambda *args: None)
+    real_revoke = module._revoke_traversal
+    monkeypatch.setattr(
+        module,
+        "_revoke_traversal",
+        lambda partial: (revoked.append(partial.name), real_revoke(partial))[1],
+    )
+
+    def broken(uid, gid, data, dest, names):
+        raise RuntimeError("snapshot_failed (1): boom")
+
+    with pytest.raises(RuntimeError, match="snapshot_failed"):
+        _run(_fixture_tree(tmp_path), tmp_path / "essential", snapshot_runner=broken)
+
+    assert revoked
+
+
 def test_snapshot_command_drops_privileges_to_the_file_owner():
     argv = snapshot_command(
         10000, 10000, Path("/srv/hermes/data"), Path("/tmp/s"), ["state.db"]
@@ -2975,6 +3037,29 @@ def _tree_bytes(root: Path) -> int:
     return total
 
 
+def _grant_traversal(partial: Path, snapshots: Path, uid: int, gid: int) -> None:
+    """Let the unprivileged snapshot child reach its own directory.
+
+    The child runs as the Hermes uid, so a 0700 root:root parent would
+    deny it before SQLite is even opened. 0710 with the child's group
+    grants traversal and nothing else: the directory stays unreadable and
+    unlistable, and the grant lasts only while the snapshot runs.
+    """
+    if os.geteuid() != 0:
+        return
+    os.chown(snapshots, uid, gid)
+    snapshots.chmod(0o700)
+    os.chown(partial, 0, gid)
+    partial.chmod(0o710)
+
+
+def _revoke_traversal(partial: Path) -> None:
+    if os.geteuid() != 0:
+        return
+    os.chown(partial, 0, 0)
+    partial.chmod(0o700)
+
+
 def _validate_structured(staging: Path) -> None:
     """A file caught mid-write must never reach the archive.
 
@@ -3035,9 +3120,13 @@ def run(
         _validate_structured(staging)
 
         snapshots.mkdir(mode=0o700)
-        if os.geteuid() == 0:
-            os.chown(snapshots, uid, gid)
-        runner(uid, gid, data, snapshots, DATABASES)
+        _grant_traversal(partial, snapshots, uid, gid)
+        try:
+            runner(uid, gid, data, snapshots, DATABASES)
+        finally:
+            # Give the private directory back even when the child failed:
+            # a group-traversable partial must not outlive the snapshot.
+            _revoke_traversal(partial)
         missing = [name for name in DATABASES if not (snapshots / name).exists()]
         if missing:
             raise RuntimeError(f"snapshot_missing: {missing}")
@@ -4738,9 +4827,27 @@ ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
   '/srv/hermes/app/deploy/beget/hermes_essential_backup.sh'
 ```
 
-Expected: строка `hermes_essential_backup_OK path=/srv/hermes/backups/essential/daily-<UTC>`.
-Проверить, что в каталоге ровно пять файлов и что `STATE` содержит
-`EXPECTED_SESSIONS=2`, `EXPECTED_SKILLS=78`, `EXPECTED_PLUGINS=3`.
+Expected: строка `hermes_essential_backup_OK path=/srv/hermes/backups/essential/daily-<UTC> files=… unclassified=… specials=…`.
+
+Это первая живая проверка понижения привилегий. В выводе не должно быть
+`Permission denied` и `snapshot_failed`: если они есть, дочерний процесс под
+uid Hermes не смог пройти через `partial`, и правки прав не работают.
+Дополнительно убедиться:
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+latest=$(ls -1dt /srv/hermes/backups/essential/daily-* | head -1)
+echo "каталог: $latest"
+stat -c "%U:%G %a %n" "$latest"
+ls -1 "$latest" | sort | tr "\n" " "; echo
+grep -E "EXPECTED_SESSIONS|EXPECTED_SKILLS|EXPECTED_PLUGINS|EXCLUDED_SPECIAL_COUNT" "$latest/STATE"
+EOF
+```
+
+Ожидается `root:root 700`, ровно пять файлов и `EXPECTED_SESSIONS=2`,
+`EXPECTED_SKILLS=78`, `EXPECTED_PLUGINS=3`. Ни одного каталога с правами `710`
+после завершения остаться не должно.
 
 - [ ] **Step 4: Установить таймеры**
 
