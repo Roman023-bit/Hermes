@@ -2574,6 +2574,7 @@ import json
 import os
 import sqlite3
 import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -3416,6 +3417,7 @@ git commit -m "feat(backup): publish the essential backup atomically on Aeza"
 # tests/backup/test_full_backup.py
 import sqlite3
 import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -3553,20 +3555,22 @@ def test_owner_mismatch_after_the_snapshot_fails_closed(tmp_path, monkeypatch):
     assert calls["n"] == 2
 
 
+def _main_args(tmp_path, data, status_dir):
+    return [
+        "--data", str(data),
+        "--backup-dir", str(tmp_path / "backups"),
+        "--status-dir", str(status_dir),
+        "--config", str(tmp_path / "absent.yaml"),
+    ]
+
+
 def test_status_records_success(tmp_path):
-    data = _fixture_tree(tmp_path)
-    status_dir = tmp_path / "status"
     from hermes_backup.full_backup import main
 
-    code = main(
-        [
-            "--data", str(data),
-            "--backup-dir", str(tmp_path / "backups"),
-            "--status-dir", str(status_dir),
-            "--config", str(tmp_path / "absent.yaml"),
-            "--in-process-snapshots",
-        ]
-    )
+    data = _fixture_tree(tmp_path)
+    status_dir = tmp_path / "status"
+
+    code = main(_main_args(tmp_path, data, status_dir), snapshot_runner=_direct_runner)
 
     assert code == 0
     record = read_status(status_dir, "full_backup")
@@ -3575,25 +3579,73 @@ def test_status_records_success(tmp_path):
 
 
 def test_status_records_failure(tmp_path):
+    from hermes_backup.full_backup import main
+
     data = _fixture_tree(tmp_path)
     (data / "state.db").unlink()
     status_dir = tmp_path / "status"
-    from hermes_backup.full_backup import main
 
-    code = main(
-        [
-            "--data", str(data),
-            "--backup-dir", str(tmp_path / "backups"),
-            "--status-dir", str(status_dir),
-            "--config", str(tmp_path / "absent.yaml"),
-            "--in-process-snapshots",
-        ]
-    )
+    code = main(_main_args(tmp_path, data, status_dir), snapshot_runner=_direct_runner)
 
     assert code == 1
     record = read_status(status_dir, "full_backup")
     assert record["outcome"] == "FAILED"
     assert "missing_database" in record["reason"]
+
+
+def test_record_skip_writes_a_skipped_status_and_exits_75(tmp_path):
+    from hermes_backup.full_backup import main
+
+    status_dir = tmp_path / "status"
+    code = main(
+        _main_args(tmp_path, tmp_path / "data", status_dir) + ["--record-skip"]
+    )
+
+    assert code == 75
+    record = read_status(status_dir, "full_backup")
+    assert record["outcome"] == "SKIPPED"
+    assert record["reason"] == "locked"
+
+
+def test_no_cli_flag_can_bypass_setpriv():
+    """A production-reachable switch around privilege dropping is the one
+    thing this module must not offer."""
+    source = (
+        Path(__file__).resolve().parents[2] / "hermes_backup" / "full_backup.py"
+    ).read_text()
+    assert "--in-process-snapshots" not in source
+
+
+def test_snapshots_are_gone_before_the_archive_is_published(tmp_path, monkeypatch):
+    """A published archive must never coexist with loose database copies."""
+    import hermes_backup.full_backup as module
+
+    seen: dict[str, bool] = {}
+    real_replace = Path.replace
+
+    def spy_replace(self, target):
+        seen["snapshot_dirs"] = any(
+            Path("/tmp").glob("hermes-full-snapshots-*")
+        ) or bool(list(Path(tempfile.gettempdir()).glob("hermes-full-snapshots-*")))
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", spy_replace)
+    _run(_fixture_tree(tmp_path), tmp_path / "backups")
+    assert seen["snapshot_dirs"] is False
+
+
+def test_a_stray_sidecar_in_the_archive_is_rejected():
+    from hermes_backup.full_backup import _require_snapshot_layout
+
+    with pytest.raises(RuntimeError, match="sidecars"):
+        _require_snapshot_layout("./config.yaml\nstate.db\nkanban.db\nstate.db-wal\n")
+
+
+def test_a_duplicated_database_in_the_archive_is_rejected():
+    from hermes_backup.full_backup import _require_snapshot_layout
+
+    with pytest.raises(RuntimeError, match="copies of state.db"):
+        _require_snapshot_layout("./state.db\nstate.db\nkanban.db\n")
 
 
 def test_wrapper_is_a_thin_launcher_with_a_trap():
@@ -3602,7 +3654,11 @@ def test_wrapper_is_a_thin_launcher_with_a_trap():
     assert "/run/lock/hermes-backup.lock" in wrapper
     assert "hermes_backup.full_backup" in wrapper
     assert "trap" in wrapper
-    assert "hermes_full_backup_SKIPPED" in wrapper
+    assert "--record-skip" in wrapper
+    # exec hands the process to Python: the wrapper's trap must not survive
+    # to print a second, contradictory status line.
+    assert "exec /usr/bin/python3" in wrapper
+    assert '[ "$code" -eq 75 ]' in wrapper
     # Behaviour lives in config.yaml, not in the environment.
     assert "HERMES_BACKUP_KEEP" not in wrapper
 
@@ -3655,13 +3711,8 @@ from hermes_backup.essential_backup import (
     require_single_owner,
     setpriv_runner,
 )
-from hermes_backup.sqlite_snapshot import integrity_check, snapshot
+from hermes_backup.sqlite_snapshot import foreign_key_check, integrity_check
 from hermes_backup.status import status_line, write_status
-
-
-def _in_process_runner(uid, gid, data: Path, dest: Path, names) -> None:
-    for name in names:
-        snapshot(data / name, dest / name)
 
 
 def run(
@@ -3678,13 +3729,19 @@ def run(
 
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_dir.chmod(0o700)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    # Microseconds, not seconds: two runs in the same second would other-
+    # wise write the same name and the second would replace the first.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     archive = backup_dir / f"hermes-{stamp}.tar.gz"
-    partial = archive.with_suffix(".tar.gz.partial")
+    if archive.exists():
+        raise RuntimeError(f"already_published: {archive}")
+    # with_suffix would turn hermes-x.tar.gz into hermes-x.tar.tar.gz.partial.
+    partial = Path(f"{archive}.partial")
 
     # PrivateTmp keeps this out of the host's /tmp; the child needs to own
     # it, so it cannot live inside the root-only backup directory.
     snapshots = Path(tempfile.mkdtemp(prefix="hermes-full-snapshots-"))
+    snapshots_removed = False
     try:
         import os
 
@@ -3697,6 +3754,7 @@ def run(
             raise RuntimeError(f"snapshot_missing: {missing}")
         for name in DATABASES:
             integrity_check(snapshots / name)
+            foreign_key_check(snapshots / name)
         # The child touched the live databases: prove it left them alone.
         require_single_owner(paths)
 
@@ -3728,16 +3786,42 @@ def run(
         )
         if verify.returncode != 0:
             raise RuntimeError("archive_unreadable")
+        _require_snapshot_layout(verify.stdout)
+
+        # Remove the snapshots before publishing, and fail if that does not
+        # work: an archive must never be announced as done while a readable
+        # copy of both databases is still lying around.
+        shutil.rmtree(snapshots)
+        if snapshots.exists():
+            raise RuntimeError(f"snapshot_cleanup_failed: {snapshots}")
+        snapshots_removed = True
+
         partial.replace(archive)
         archive.chmod(0o600)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
     finally:
-        shutil.rmtree(snapshots, ignore_errors=True)
+        if not snapshots_removed:
+            shutil.rmtree(snapshots, ignore_errors=True)
 
     _prune(backup_dir, settings.retention_server)
     return archive
+
+
+def _require_snapshot_layout(listing: str) -> None:
+    """The archive must carry one snapshot per database and no sidecars."""
+    names = [line.strip().lstrip("./") for line in listing.splitlines() if line.strip()]
+    for name in DATABASES:
+        if names.count(name) != 1:
+            raise RuntimeError(f"archive_layout: {names.count(name)} copies of {name}")
+    strays = [
+        name
+        for name in names
+        if any(name.startswith(f"{database}-") for database in DATABASES)
+    ]
+    if strays:
+        raise RuntimeError(f"archive_layout: live sidecars in archive: {strays}")
 
 
 def _prune(backup_dir: Path, keep: int) -> None:
@@ -3749,25 +3833,34 @@ def _prune(backup_dir: Path, keep: int) -> None:
         stale.unlink(missing_ok=True)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, snapshot_runner=None) -> int:
+    """Entry point.
+
+    ``snapshot_runner`` is a keyword argument rather than a CLI flag on
+    purpose: a command-line switch would be a production-reachable way to
+    bypass setpriv, and only pytest has any business passing one.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=Path, default=config.SERVER_DATA)
     parser.add_argument("--backup-dir", type=Path, default=config.SERVER_FULL_ROOT)
     parser.add_argument("--status-dir", type=Path, default=config.SERVER_STATUS_DIR)
     parser.add_argument("--config", type=Path, default=config.SERVER_CONFIG)
     parser.add_argument(
-        "--in-process-snapshots",
+        "--record-skip",
         action="store_true",
-        help="take snapshots without setpriv (tests only)",
+        help="record that the shared lock was busy and exit 75",
     )
     args = parser.parse_args(argv)
-    runner = _in_process_runner if args.in_process_snapshots else None
+    if args.record_skip:
+        write_status(args.status_dir, "full_backup", "SKIPPED", reason="locked")
+        print(status_line("full_backup", "SKIPPED", "locked"))
+        return 75
     try:
         archive = run(
             args.data,
             args.backup_dir,
             settings=load_settings(args.config),
-            snapshot_runner=runner,
+            snapshot_runner=snapshot_runner,
         )
     except BaseException as error:  # noqa: BLE001 — status must always be emitted
         write_status(args.status_dir, "full_backup", "FAILED", reason=str(error))
@@ -3799,21 +3892,19 @@ umask 0077
 APP=/srv/hermes/app
 LOCK=/run/lock/hermes-backup.lock
 
-status=1
-# set -e can end the script before any status is printed; the trap makes
-# the machine-readable line unconditional.
-trap '[ "$status" -eq 0 ] || echo "hermes_full_backup_FAILED wrapper exit=$status" >&2' EXIT
+# The trap only covers this wrapper failing before Python takes over: on a
+# successful exec the shell — and this trap with it — is replaced, and the
+# only status line comes from Python. Exit 75 is the documented "lock was
+# busy" result and must not be reported as a failure.
+trap 'code=$?; [ "$code" -eq 0 ] || [ "$code" -eq 75 ] ||
+  echo "hermes_full_backup_FAILED wrapper exit=$code" >&2' EXIT
 
 exec 9>"$LOCK"
 if ! flock -n 9; then
-  status=0
-  echo "hermes_full_backup_SKIPPED locked"
-  exit 75
+  PYTHONPATH="$APP" exec /usr/bin/python3 -m hermes_backup.full_backup --record-skip "$@"
 fi
 
-PYTHONPATH="$APP" /usr/bin/python3 -m hermes_backup.full_backup "$@"
-status=$?
-exit "$status"
+PYTHONPATH="$APP" exec /usr/bin/python3 -m hermes_backup.full_backup "$@"
 ```
 
 - [ ] **Step 6: Написать юниты**
@@ -3848,7 +3939,7 @@ WantedBy=timers.target
 - [ ] **Step 7: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup -v`
-Expected: PASS — 13 тестов Task 12 плюс весь предыдущий набор.
+Expected: PASS — 18 тестов Task 12 плюс весь предыдущий набор.
 
 - [ ] **Step 8: Коммит**
 
