@@ -7,7 +7,7 @@
 - Hermes использует `http://knowledge-factory:8000/mcp` через закрытую
   Docker-сеть `hermes-internal`;
 - PostgreSQL, Qdrant и MCP не публикуют порты на хост;
-- восстановлено 96 документов, 620 чанков и 620 точек;
+- восстановлено 96 документов, 621 чанк и 621 точка;
 - `hermes mcp test knowledge_factory` прошёл 5/5 до перезагрузки и повторно
   после холодного старта VPS;
 - контейнеры `hermes`, `knowledge-factory`, `kf-postgres`, `kf-qdrant`
@@ -15,7 +15,7 @@
 - ежедневный application-consistent backup включён через
   `knowledge-factory-backup.timer`;
 - изолированный restore drill включён ежемесячно и уже подтверждён на
-  реальном backup: 96/620/620 плюс контрольный поиск;
+  реальном backup: 96/621/621 плюс контрольный поиск;
 - внутренний healthcheck выполняется каждые 10 минут;
 - off-site копия хранится на Mac и обновляется LaunchAgent
   `com.knowledge-factory.backup-pull`;
@@ -1141,12 +1141,13 @@ Model cache можно не включать в off-site backup: он восст
 ```text
 Цифровой мозг на Mac
    ├── локальный kf update
-   └── filtered rsync по SSH
-          └── incoming-sources на Aeza
-                 └── SHA-манифест совпал
-                        └── общий lock с backup
-                               ├── atomic mirror в production sources
-                               └── kf update на Aeza
+   ├── индексный filtered rsync → incoming-sources
+   └── полный raw rsync         → incoming-raw-mirror
+          └── оба SHA-манифеста совпали
+                 └── общий lock с backup
+                        ├── atomic mirror в production sources
+                        ├── atomic mirror в raw-mirror
+                        └── kf update на Aeza
 ```
 
 PostgreSQL и Qdrant между машинами не копируются. Каждая фабрика строит свой
@@ -1177,7 +1178,7 @@ Documents блокируется TCC с `Operation not permitted`.
 Старый `com.knowledge-factory.autoupdate` остаётся disabled. Его функцию
 выполняет новый sync-wrapper, который сначала обновляет локальную фабрику.
 
-### 24.2. Фильтр и целостность
+### 24.2. Индексный фильтр и целостность
 
 Передаются только расширения, которые понимает `kf.sources.scan`:
 `.md`, `.txt`, `.pdf`, `.docx`, `.csv`. Исключаются `.git`, virtualenv,
@@ -1192,13 +1193,14 @@ Rsync никогда не пишет прямо в production source tree. Он 
 `knowledge-factory-update.lock` зеркалирует incoming в
 `/srv/knowledge-factory/data/sources` и запускает индексатор. Ежедневный backup
 берёт тот же lock, поэтому не может сохранить новые документы со старым
-PostgreSQL/Qdrant индексом.
+PostgreSQL/Qdrant индексом или неполным raw-mirror.
 
 Удаление включено через `--delete-delay`, но fail-closed:
 
 - источник обязан содержать карту базы и минимум 50 поддерживаемых файлов;
 - максимум 10 удаляемых документов за один цикл;
 - максимум 20% от удалённого manifest;
+- для raw-mirror отдельный лимит: максимум 25 файлов и 20% за цикл;
 - число удалений считается по путям двух manifests, а не по строкам rsync;
 - при превышении лимита rsync не меняет сервер;
 - каталоги защищены от удаления, поэтому неиндексируемые вложения не создают
@@ -1213,8 +1215,11 @@ Dispatcher `/usr/local/sbin/kf-sync-dispatch` разрешает только:
 
 1. принимающий rsync строго в
    `/srv/knowledge-factory/data/incoming-sources/`;
-2. `kf-manifest`;
-3. `kf-update` через единственную sudo-команду
+2. принимающий rsync строго в
+   `/srv/knowledge-factory/data/incoming-raw-mirror/`;
+3. `kf-manifest`, `kf-raw-manifest` и read-only
+   `kf-live-raw-manifest`;
+4. `kf-update` через единственную sudo-команду
    `/usr/local/sbin/kf-update-production`.
 
 Произвольная команда возвращает exit code 126. Wrapper обновления использует
@@ -1236,6 +1241,13 @@ LaunchAgent не выдаёт пропущенный update за успешну�
 - параллельный запуск пропускается по lock;
 - серверный update при занятом backup/update lock возвращает 75;
 - LaunchAgent прошёл реальный цикл с exit code 0.
+- первичное raw-зеркало: 176 файлов / 205 187 397 байт;
+- manifests Mac, incoming, production и распакованного backup совпали;
+- `.env`, приватные ключи и служебные каталоги в raw-mirror отсутствуют;
+- новый backup `daily-20260726T094823Z` проверен restore drill:
+  96 документов / 621 чанк / 621 точка;
+- прежний полный архив закреплён вне daily-ротации как
+  `protected-full-sources-20260726T090113Z`.
 
 ### 24.5. Проверка и rollback
 
@@ -1271,3 +1283,40 @@ launchctl bootout \
 Linux OCR по-прежнему выключен. Новые Markdown/TXT/DOCX/CSV и PDF с текстовым
 слоем синхронизируются автоматически; новые сканированные PDF будут полностью
 одинаково индексироваться только после приёмки Этапа B.
+
+### 24.6. Полная копия «Цифрового мозга»
+
+`sources/` остаётся индексным деревом из `.md`, `.txt`, `.pdf`, `.docx` и
+`.csv`. Расширять этот whitelist ради резервного копирования запрещено:
+неподдерживаемые форматы не должны попадать в индексатор.
+
+Полная полезная копия хранится отдельно:
+
+- staging: `/srv/knowledge-factory/data/incoming-raw-mirror`;
+- production: `/srv/knowledge-factory/data/raw-mirror`;
+- manifest: `/usr/local/libexec/kf-raw-source-manifest`;
+- backup: `raw-mirror.tar.gz` внутри каждого нового `daily-*`.
+
+Raw-mirror включает изображения, XLSX, код, шрифты и остальные обычные файлы
+независимо от расширения. Из него исключаются `.git`, virtualenv,
+`node_modules`, `_System`, cache/build-каталоги, `.DS_Store`, `.env`,
+приватные ключи и типовые credential-файлы. Raw-mirror никогда не монтируется
+в контейнер Knowledge Factory и не индексируется.
+
+Проверка:
+
+```bash
+/usr/local/libexec/kf-raw-source-manifest \
+  /srv/knowledge-factory/data/raw-mirror --count-only
+latest="$(find /srv/knowledge-factory/data/backups -mindepth 1 -maxdepth 1 \
+  -type d -name 'daily-*' -printf '%p\n' | sort | tail -1)"
+(cd "$latest" && sha256sum -c SHA256SUMS)
+test -s "$latest/raw-mirror.tar.gz"
+```
+
+Daily retention продолжает обрабатывать только каталоги `daily-*`.
+`protected-full-sources-20260726T090113Z` намеренно не соответствует этому
+шаблону и не удаляется ротацией. Он содержит исторический `.env`, поэтому
+остаётся с правами `0700` и используется только как временная страховка;
+после подтверждения нескольких off-site raw-backup его следует удалить
+без распаковки.
