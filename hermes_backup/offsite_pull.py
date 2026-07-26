@@ -173,9 +173,12 @@ def check_freshness(root: Path, max_age_hours: int) -> Path:
     state = verify_backup(newest)
     # CREATED_AT, not mtime: mtime says when we downloaded it, and a
     # week-old archive fetched today would look brand new.
-    created = datetime.strptime(str(state["CREATED_AT"]), "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
-    )
+    try:
+        created = datetime.strptime(
+            str(state["CREATED_AT"]), "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise RuntimeError(f"created_at_invalid {state['CREATED_AT']!r}") from error
     age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
     if age_hours > max_age_hours:
         raise RuntimeError(f"stale_backup age_hours={age_hours:.1f}")

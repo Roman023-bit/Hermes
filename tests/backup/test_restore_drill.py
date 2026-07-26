@@ -281,3 +281,38 @@ def test_wrapper_locates_the_repository_relative_to_itself():
     assert 'cd "$REPO"' in text
     assert ".venv/bin/python" in text
     assert "HERMES_REPO" not in text
+
+
+def test_a_substituted_inventory_is_caught(tmp_path):
+    """Totals can be preserved while every checksum in the file is a lie."""
+    published = _published(tmp_path)
+    rows = [
+        json.loads(line)
+        for line in (published / "INVENTORY.jsonl").read_text().splitlines()
+    ]
+    rows[0]["sha256"] = "f" * 64
+    (published / "INVENTORY.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+    write_sha256sums(published)
+
+    with pytest.raises(DrillError, match="inventory_mismatch"):
+        drill(published)
+
+
+def test_an_executable_secret_is_rejected(tmp_path):
+    """0700 is not "no wider than 0600" — it is a mode no secret should have."""
+
+    def loosen(tree: Path, published: Path) -> None:
+        (tree / "auth.json").chmod(0o700)
+
+    published = _rewrite(_published(tmp_path), loosen)
+    with pytest.raises(DrillError, match="permissions_too_wide"):
+        drill(published)
+
+
+def test_an_unparsable_created_at_is_a_drill_error(tmp_path):
+    published = _published(tmp_path)
+    _set_state(published, "CREATED_AT", "not-a-date")
+    with pytest.raises(DrillError, match="created_at_invalid"):
+        drill(published)

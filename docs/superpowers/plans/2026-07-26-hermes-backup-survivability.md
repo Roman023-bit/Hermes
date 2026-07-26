@@ -4985,9 +4985,14 @@ class DrillError(RuntimeError):
 def _check_age(state: dict, staleness_hours: int) -> None:
     # CREATED_AT, not mtime: mtime says when the copy landed here, so an
     # old server archive pulled today would look brand new.
-    created = datetime.strptime(str(state["CREATED_AT"]), "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
-    )
+    try:
+        created = datetime.strptime(
+            str(state["CREATED_AT"]), "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        # An unparsable timestamp is a failed drill, not a traceback: the
+        # status file must say what happened.
+        raise DrillError(f"created_at_invalid {state['CREATED_AT']!r}") from error
     age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
     if age_hours > staleness_hours:
         raise DrillError(f"stale_backup age_hours={age_hours:.1f}")
@@ -5040,9 +5045,15 @@ def _check_counts(tree: Path, state: dict) -> dict:
     return counts
 
 
-def _check_inventory(tree: Path, workdir: Path, state: dict) -> None:
-    """Recount the tree: STATE may claim anything, the files decide."""
-    totals = write_inventory(tree, workdir / "inventory-recomputed.jsonl")
+def _check_inventory(backup: Path, tree: Path, workdir: Path, state: dict) -> None:
+    """Recount the tree and compare it with what the backup claims.
+
+    Totals alone are not enough: a substituted INVENTORY.jsonl can keep the
+    same file count and byte total while lying about every checksum, so the
+    recorded rows are compared with the recomputed ones entry by entry.
+    """
+    recomputed_path = workdir / "inventory-recomputed.jsonl"
+    totals = write_inventory(tree, recomputed_path)
     for actual, state_key in (
         (totals.files, "ESSENTIAL_FILE_COUNT"),
         (totals.total_bytes, "ESSENTIAL_TOTAL_BYTES"),
@@ -5063,7 +5074,10 @@ def _secret_paths(tree: Path):
 def _require_private_modes(tree: Path) -> None:
     for path in _secret_paths(tree):
         mode = stat.S_IMODE(path.stat().st_mode)
-        if mode & 0o077:
+        # Anything outside owner read/write is wrong for a secret, execute
+        # included: 0700 is not "no wider than 0600", it is a different mode
+        # nothing in this tree should ever have.
+        if mode & ~0o600:
             raise DrillError(f"permissions_too_wide {path.relative_to(tree)} {mode:o}")
 
 
@@ -5097,7 +5111,7 @@ def drill(
             raise DrillError("config_empty")
 
         counts = _check_counts(tree, state)
-        _check_inventory(tree, workdir, state)
+        _check_inventory(backup, tree, workdir, state)
         _require_private_modes(tree)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -5157,7 +5171,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_restore_drill.py -v`
-Expected: PASS, 20 тестов.
+Expected: PASS, 23 теста.
 
 - [ ] **Step 5: Написать обёртку и LaunchAgent**
 

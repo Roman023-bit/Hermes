@@ -270,3 +270,23 @@ def test_wrapper_locates_the_repository_relative_to_itself():
     assert 'cd "$REPO"' in text
     assert ".venv/bin/python" in text
     assert "PYTHONPATH" not in text
+
+
+def test_an_unparsable_created_at_is_reported(tmp_path):
+    root = tmp_path / "offsite"
+    directory = _make_backup(root / f"daily-{STAMP}", created_at="whenever")
+    lines = [
+        line
+        for line in (directory / "STATE").read_text().splitlines()
+        if not line.startswith("CREATED_AT=")
+    ]
+    (directory / "STATE").write_text("\n".join(lines + ["CREATED_AT=whenever"]) + "\n")
+    digest = hashlib.sha256((directory / "STATE").read_bytes()).hexdigest()
+    manifest = [
+        f"{digest}  STATE" if line.endswith("  STATE") else line
+        for line in (directory / "SHA256SUMS").read_text().splitlines()
+    ]
+    (directory / "SHA256SUMS").write_text("\n".join(manifest) + "\n")
+
+    with pytest.raises(RuntimeError, match="created_at_invalid"):
+        check_freshness(root, 26)
