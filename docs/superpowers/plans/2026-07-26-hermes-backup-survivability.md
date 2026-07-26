@@ -5978,7 +5978,7 @@ uv run pytest tests/test_pull_filevault_gate.py -v
 uv run pytest -q
 ```
 
-Expected: `bash -n` молчит; 7 тестов гейта проходят; полный набор — 228 passed,
+Expected: `bash -n` молчит; 6 тестов гейта проходят; полный набор — 227 passed,
 1 skipped.
 
 - [ ] **Step 5: Локальный коммит**
