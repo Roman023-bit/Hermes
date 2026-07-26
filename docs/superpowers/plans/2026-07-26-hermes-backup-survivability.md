@@ -3961,9 +3961,27 @@ git commit -m "fix(backup): stop tarring live SQLite files in the full archive"
 
 **Interfaces:**
 - Consumes: `locks.FileLock`, `state.parse_state`, `status.*`, `config.*`.
-- Produces: `FileVaultOff(RuntimeError)`; `require_filevault(command: list[str] | None = None) -> None`; `pull(root: Path, remote: str, key: Path, *, runner=subprocess.run) -> Path`; `check_freshness(root: Path, max_age_hours: int) -> Path`; `main(argv=None) -> int`.
+- Produces: `FileVaultOff(RuntimeError)`; `require_filevault(command=None) -> None`; `BACKUP_FILES: frozenset[str]`; `verify_backup(directory: Path) -> dict`; `pull(root, remote, key, remote_root=..., runner=subprocess.run) -> Path`; `check_freshness(root, max_age_hours) -> Path`; `prune(root, keep, floor) -> None`; `main(argv=None) -> int`.
 
-- [ ] **Step 1: Написать падающий тест**
+**Обязательные критерии приёмки:**
+
+1. **Структура каталога проверяется, а не подразумевается.** Ровно пять
+   объектов, все — обычные файлы; имена совпадают с `BACKUP_FILES`;
+   `SHA256SUMS` содержит ровно четыре строки без дубликатов, без `/` и `..` в
+   именах и без неизвестных файлов; каждый digest — ровно 64 hex-символа.
+2. **Свежесть считается по `CREATED_AT` из проверенного `STATE`.** Локальный
+   `mtime` говорит, когда мы скачали, а не когда сняли: старый серверный архив,
+   притянутый сегодня, иначе выглядел бы свежим.
+3. **Коды обоих сетевых процессов проверяются.** Ненулевой SSH — отказ;
+   ошибка rsync включает stderr; после прерванного переноса не остаётся
+   видимого `daily-*`; `verify_backup()` выполняется до `rename`.
+4. **Права.** `.daily-*.partial` и опубликованный каталог — `0700`, все пять
+   файлов — `0600`; проверяется тестом после публикации.
+5. **Никакого окружения в LaunchAgent.** Ни `HERMES_REPO`, ни `PYTHONPATH`:
+   обёртка вычисляет корень репозитория относительно собственного пути,
+   переходит в него и запускает `.venv/bin/python`.
+
+- [ ] **Step 1: Написать падающие тесты**
 
 ```python
 # tests/backup/test_filevault.py
@@ -3988,34 +4006,205 @@ def test_gate_fails_closed_when_the_tool_is_missing():
 
 ```python
 # tests/backup/test_offsite_pull.py
+import hashlib
 import json
+import plistlib
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-from hermes_backup.offsite_pull import check_freshness, prune
+from hermes_backup.offsite_pull import (
+    BACKUP_FILES,
+    check_freshness,
+    prune,
+    pull,
+    verify_backup,
+)
+
+REPO = Path(__file__).resolve().parents[2]
+PLIST = REPO / "deploy" / "macos" / "com.hermes.offsite-pull.plist"
+WRAPPER = REPO / "deploy" / "macos" / "hermes_pull_offsite.sh"
+STAMP = "20260726T031500Z"
 
 
-def _backup(root, stamp, age_hours=0):
-    directory = root / f"daily-{stamp}"
+def _state_text(created_at: str) -> str:
+    values = {
+        "BACKUP_FORMAT_VERSION": 1,
+        "CREATED_AT": created_at,
+        "SOURCE_HOST": "aeza",
+        "HERMES_GIT_SHA": "abc1234",
+        "HERMES_IMAGE_ID": "sha256:abc",
+        "HERMES_IMAGE_REF": "hermes:latest",
+        "STATE_DB_SHA256": "a" * 64,
+        "STATE_DB_PAGE_COUNT": 10,
+        "STATE_DB_USER_VERSION": 0,
+        "KANBAN_DB_SHA256": "b" * 64,
+        "KANBAN_DB_PAGE_COUNT": 2,
+        "KANBAN_DB_USER_VERSION": 0,
+        "EXPECTED_SESSIONS": 2,
+        "EXPECTED_SKILLS": 78,
+        "EXPECTED_PLUGINS": 3,
+        "EXPECTED_CRON_JOBS": 4,
+        "ESSENTIAL_FILE_COUNT": 900,
+        "ESSENTIAL_TOTAL_BYTES": 1000,
+        "UNCLASSIFIED_FILE_COUNT": 0,
+        "EXCLUDED_SPECIAL_COUNT": 0,
+    }
+    return "".join(f"{key}={values[key]}\n" for key in sorted(values))
+
+
+def _make_backup(directory: Path, created_at: str | None = None) -> Path:
+    """A well-formed backup directory, exactly as the server publishes it."""
     directory.mkdir(parents=True)
-    (directory / "STATE").write_text("BACKUP_FORMAT_VERSION=1\n")
-    moment = (datetime.now(timezone.utc) - timedelta(hours=age_hours)).timestamp()
-    import os
-
-    os.utime(directory, (moment, moment))
+    created_at = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "essential.tar.gz": b"archive-bytes",
+        "STATE": _state_text(created_at).encode(),
+        "INVENTORY.jsonl": b'{"path": "auth.json", "type": "file"}\n',
+        "EXCLUSIONS.jsonl": b'{"path": "cache/x", "type": "file"}\n',
+    }
+    lines = []
+    for name, blob in payload.items():
+        (directory / name).write_bytes(blob)
+        (directory / name).chmod(0o600)
+        lines.append(f"{hashlib.sha256(blob).hexdigest()}  {name}\n")
+    (directory / "SHA256SUMS").write_text("".join(sorted(lines)))
+    (directory / "SHA256SUMS").chmod(0o600)
+    directory.chmod(0o700)
     return directory
 
 
-def test_freshness_accepts_a_recent_backup(tmp_path):
-    fresh = _backup(tmp_path, "20260726T031500Z", age_hours=2)
-    assert check_freshness(tmp_path, 26) == fresh
+class _Runner:
+    """Stands in for ssh and rsync, and remembers what was called."""
+
+    def __init__(self, fixture: Path, *, ssh_code: int = 0, rsync_code: int = 0):
+        self.fixture = fixture
+        self.ssh_code = ssh_code
+        self.rsync_code = rsync_code
+        self.calls: list[str] = []
+
+    def __call__(self, argv, **kwargs):
+        program = Path(argv[0]).name
+        self.calls.append(program)
+        if program == "ssh":
+            return subprocess.CompletedProcess(
+                argv,
+                self.ssh_code,
+                stdout=f"daily-{STAMP}\n" if self.ssh_code == 0 else "",
+                stderr="" if self.ssh_code == 0 else "ssh: connect timed out",
+            )
+        destination = Path(argv[-1])
+        if self.rsync_code == 0:
+            shutil.copytree(self.fixture, destination, dirs_exist_ok=True)
+        return subprocess.CompletedProcess(
+            argv,
+            self.rsync_code,
+            stdout="",
+            stderr="" if self.rsync_code == 0 else "rsync: connection unexpectedly closed",
+        )
 
 
-def test_freshness_rejects_a_stale_backup(tmp_path):
-    _backup(tmp_path, "20260720T031500Z", age_hours=100)
+def test_pull_publishes_atomically_with_private_modes(tmp_path):
+    fixture = _make_backup(tmp_path / "fixture")
+    root = tmp_path / "offsite"
+    runner = _Runner(fixture)
+
+    published = pull(root, "root@host", tmp_path / "key", runner=runner)
+
+    assert published.name == f"daily-{STAMP}"
+    assert not list(root.glob(".*partial"))
+    assert published.stat().st_mode & 0o777 == 0o700
+    for name in BACKUP_FILES:
+        assert (published / name).stat().st_mode & 0o777 == 0o600
+    assert runner.calls == ["ssh", "rsync"]
+
+
+def test_ssh_failure_is_reported_and_publishes_nothing(tmp_path):
+    fixture = _make_backup(tmp_path / "fixture")
+    root = tmp_path / "offsite"
+    runner = _Runner(fixture, ssh_code=255)
+
+    with pytest.raises(RuntimeError, match="ssh_failed"):
+        pull(root, "root@host", tmp_path / "key", runner=runner)
+
+    assert runner.calls == ["ssh"]
+    assert not list(root.glob("daily-*"))
+
+
+def test_rsync_failure_carries_stderr_and_leaves_no_visible_backup(tmp_path):
+    fixture = _make_backup(tmp_path / "fixture")
+    root = tmp_path / "offsite"
+    runner = _Runner(fixture, rsync_code=12)
+
+    with pytest.raises(RuntimeError, match="connection unexpectedly closed"):
+        pull(root, "root@host", tmp_path / "key", runner=runner)
+
+    assert not list(root.glob("daily-*"))
+    assert not list(root.glob(".*partial"))
+
+
+def test_a_partial_manifest_is_rejected(tmp_path):
+    directory = _make_backup(tmp_path / "daily-x")
+    lines = (directory / "SHA256SUMS").read_text().splitlines()[:3]
+    (directory / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(RuntimeError, match="manifest"):
+        verify_backup(directory)
+
+
+def test_path_traversal_in_the_manifest_is_rejected(tmp_path):
+    directory = _make_backup(tmp_path / "daily-x")
+    text = (directory / "SHA256SUMS").read_text()
+    (directory / "SHA256SUMS").write_text(text + f"{'c' * 64}  ../escape\n")
+
+    with pytest.raises(RuntimeError, match="manifest"):
+        verify_backup(directory)
+
+
+def test_a_bogus_digest_is_rejected(tmp_path):
+    directory = _make_backup(tmp_path / "daily-x")
+    lines = (directory / "SHA256SUMS").read_text().splitlines()
+    lines[0] = "not-a-digest  STATE"
+    (directory / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(RuntimeError, match="manifest"):
+        verify_backup(directory)
+
+
+def test_an_extra_file_is_rejected(tmp_path):
+    directory = _make_backup(tmp_path / "daily-x")
+    (directory / "surprise.txt").write_text("x")
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        verify_backup(directory)
+
+
+def test_a_symlinked_member_is_rejected(tmp_path):
+    directory = _make_backup(tmp_path / "daily-x")
+    (directory / "STATE").unlink()
+    (directory / "STATE").symlink_to(tmp_path / "elsewhere")
+
+    with pytest.raises(RuntimeError, match="regular file"):
+        verify_backup(directory)
+
+
+def test_freshness_uses_created_at_not_local_mtime(tmp_path):
+    """A week-old archive pulled today is stale, however new the directory."""
+    root = tmp_path / "offsite"
+    old = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _make_backup(root / f"daily-{STAMP}", created_at=old)
+
     with pytest.raises(RuntimeError, match="stale_backup"):
-        check_freshness(tmp_path, 26)
+        check_freshness(root, 26)
+
+
+def test_freshness_accepts_a_recent_created_at(tmp_path):
+    root = tmp_path / "offsite"
+    directory = _make_backup(root / f"daily-{STAMP}")
+    assert check_freshness(root, 26) == directory
 
 
 def test_freshness_rejects_an_empty_root(tmp_path):
@@ -4024,22 +4213,66 @@ def test_freshness_rejects_an_empty_root(tmp_path):
 
 
 def test_partial_directories_are_invisible(tmp_path):
-    (tmp_path / ".daily-20260726T031500Z.partial").mkdir()
+    (tmp_path / f".daily-{STAMP}.partial").mkdir()
     with pytest.raises(RuntimeError, match="no_backup"):
         check_freshness(tmp_path, 26)
 
 
 def test_prune_keeps_the_floor(tmp_path):
     for day in range(1, 11):
-        _backup(tmp_path, f"2026072{day % 10}T0{day}1500Z")
+        (tmp_path / f"daily-2026072{day % 10}T0{day}1500Z").mkdir()
     prune(tmp_path, keep=7, floor=2)
     assert len(list(tmp_path.glob("daily-*"))) == 7
 
 
 def test_prune_never_empties_the_directory(tmp_path):
-    _backup(tmp_path, "20260726T031500Z")
+    (tmp_path / f"daily-{STAMP}").mkdir()
     prune(tmp_path, keep=0, floor=2)
     assert len(list(tmp_path.glob("daily-*"))) == 1
+
+
+def test_filevault_off_makes_no_network_call(tmp_path, monkeypatch):
+    import hermes_backup.offsite_pull as module
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "require_filevault",
+        lambda: (_ for _ in ()).throw(module.FileVaultOff("filevault_off")),
+    )
+    monkeypatch.setattr(
+        module, "pull", lambda *a, **k: calls.append("pull") or Path("/nowhere")
+    )
+
+    code = module.main(
+        [
+            "--root", str(tmp_path / "offsite"),
+            "--status-dir", str(tmp_path / "status"),
+            "--config", str(tmp_path / "absent.yaml"),
+        ]
+    )
+
+    assert code == 1
+    assert calls == []
+
+
+def test_launch_agent_carries_no_environment():
+    data = plistlib.loads(PLIST.read_bytes())
+    assert data["Label"] == "com.hermes.offsite-pull"
+    assert data["StartCalendarInterval"] == {"Hour": 6, "Minute": 0}
+    # The wrapper finds the repository itself; env in a plist goes stale.
+    assert "EnvironmentVariables" not in data
+    text = PLIST.read_text()
+    assert "PYTHONPATH" not in text
+    assert "HERMES_REPO" not in text
+
+
+def test_wrapper_locates_the_repository_relative_to_itself():
+    text = WRAPPER.read_text()
+    assert "BASH_SOURCE" in text
+    assert 'cd "$REPO"' in text
+    assert ".venv/bin/python" in text
+    assert "PYTHONPATH" not in text
 ```
 
 - [ ] **Step 2: Прогнать тесты и убедиться, что они падают**
@@ -4102,10 +4335,21 @@ from hermes_backup.config import ConfigError, load_settings
 from hermes_backup.filevault import FileVaultOff, require_filevault
 from hermes_backup.hashing import sha256_file
 from hermes_backup.locks import FileLock, LockBusy, LockTimeout
-from hermes_backup.state import parse_state
+from hermes_backup.state import StateError, parse_state
 from hermes_backup.status import status_line, write_status
 
+BACKUP_FILES = frozenset(
+    {
+        "essential.tar.gz",
+        "STATE",
+        "INVENTORY.jsonl",
+        "EXCLUSIONS.jsonl",
+        "SHA256SUMS",
+    }
+)
+MANIFEST_NAME = "SHA256SUMS"
 STAMP = re.compile(r"\Adaily-[0-9]{8}T[0-9]{6}Z\Z")
+_DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 def _ssh_command(key: Path) -> str:
@@ -4113,6 +4357,42 @@ def _ssh_command(key: Path) -> str:
         f"ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 "
         f"-o ServerAliveCountMax=12 -i {key}"
     )
+
+
+def verify_backup(directory: Path) -> dict:
+    """Prove the directory is a complete, self-consistent backup.
+
+    Everything here is checked before the directory becomes visible as a
+    backup: a truncated transfer that happens to carry a valid STATE must
+    not be mistaken for a copy worth restoring from.
+    """
+    entries = list(directory.iterdir())
+    names = {entry.name for entry in entries}
+    if names != set(BACKUP_FILES):
+        raise RuntimeError(f"unexpected contents: {sorted(names ^ set(BACKUP_FILES))}")
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            raise RuntimeError(f"not a regular file: {entry.name}")
+
+    listed: set[str] = set()
+    for line in (directory / MANIFEST_NAME).read_text(encoding="utf-8").splitlines():
+        digest, separator, name = line.partition("  ")
+        if not separator or not _DIGEST.match(digest):
+            raise RuntimeError(f"manifest line malformed: {line!r}")
+        if "/" in name or name in {"..", "."} or name not in BACKUP_FILES - {MANIFEST_NAME}:
+            raise RuntimeError(f"manifest names an unexpected file: {name!r}")
+        if name in listed:
+            raise RuntimeError(f"manifest lists {name!r} twice")
+        listed.add(name)
+        if sha256_file(directory / name) != digest:
+            raise RuntimeError(f"checksum_mismatch {name}")
+    if listed != BACKUP_FILES - {MANIFEST_NAME}:
+        raise RuntimeError(f"manifest incomplete: missing {sorted(BACKUP_FILES - {MANIFEST_NAME} - listed)}")
+
+    try:
+        return parse_state((directory / "STATE").read_text(encoding="utf-8"))
+    except StateError as error:
+        raise RuntimeError(f"state_invalid {error}") from error
 
 
 def _latest_remote(remote: str, key: Path, remote_root: str, runner) -> str:
@@ -4133,19 +4413,18 @@ def _latest_remote(remote: str, key: Path, remote_root: str, runner) -> str:
         text=True,
         check=False,
     )
+    if result.returncode != 0:
+        raise RuntimeError(f"ssh_failed ({result.returncode}): {result.stderr.strip()}")
     name = result.stdout.strip()
     if not STAMP.match(name):
         raise RuntimeError(f"invalid_remote_name {name!r}")
     return name
 
 
-def _verify(directory: Path) -> None:
-    sums = directory / "SHA256SUMS"
-    for line in sums.read_text(encoding="utf-8").splitlines():
-        digest, name = line.split("  ", 1)
-        if sha256_file(directory / name) != digest:
-            raise RuntimeError(f"checksum_mismatch {name}")
-    parse_state((directory / "STATE").read_text(encoding="utf-8"))
+def _apply_modes(directory: Path) -> None:
+    directory.chmod(0o700)
+    for item in directory.iterdir():
+        item.chmod(0o600)
 
 
 def pull(
@@ -4160,13 +4439,13 @@ def pull(
     name = _latest_remote(remote, key, remote_root, runner)
     published = root / name
     if published.exists():
-        _verify(published)
+        verify_backup(published)
         return published
 
     partial = root / f".{name}.partial"
     if partial.exists():
         shutil.rmtree(partial)
-    partial.mkdir()
+    partial.mkdir(mode=0o700)
     try:
         result = runner(
             [
@@ -4178,17 +4457,22 @@ def pull(
                 f"{remote}:{remote_root}/{name}/",
                 f"{partial}/",
             ],
+            capture_output=True,
+            text=True,
             check=False,
         )
-        if getattr(result, "returncode", 0) != 0:
-            raise RuntimeError(f"rsync_failed {result.returncode}")
-        _verify(partial)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"rsync_failed ({result.returncode}): {result.stderr.strip()}"
+            )
+        _apply_modes(partial)
+        # Verify before the rename: nothing may become visible as a backup
+        # until it has proven itself complete.
+        verify_backup(partial)
         partial.rename(published)
     except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
         raise
-    for item in published.rglob("*"):
-        item.chmod(0o600 if item.is_file() else 0o700)
     return published
 
 
@@ -4197,9 +4481,15 @@ def check_freshness(root: Path, max_age_hours: int) -> Path:
     if not backups:
         raise RuntimeError("no_backup")
     newest = backups[-1]
-    age = datetime.now(timezone.utc).timestamp() - newest.stat().st_mtime
-    if age > max_age_hours * 3600:
-        raise RuntimeError(f"stale_backup age_hours={age / 3600:.1f}")
+    state = verify_backup(newest)
+    # CREATED_AT, not mtime: mtime says when we downloaded it, and a
+    # week-old archive fetched today would look brand new.
+    created = datetime.strptime(str(state["CREATED_AT"]), "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+    if age_hours > max_age_hours:
+        raise RuntimeError(f"stale_backup age_hours={age_hours:.1f}")
     return newest
 
 
@@ -4223,6 +4513,7 @@ def main(argv: list[str] | None = None) -> int:
         write_status(args.status_dir, "offsite_pull", "FAILED", reason=str(error))
         print(status_line("offsite_pull", "FAILED", str(error)), file=sys.stderr)
         return 1
+
     lock = FileLock(config.MAC_NETWORK_LOCK, owner="hermes-pull")
     try:
         lock.acquire(wait_seconds=settings.network_lock_wait_seconds)
@@ -4260,15 +4551,19 @@ if __name__ == "__main__":
 - [ ] **Step 5: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_filevault.py tests/backup/test_offsite_pull.py -v`
-Expected: PASS, 9 тестов.
+Expected: PASS, 20 тестов (3 filevault + 17 offsite_pull).
 
 - [ ] **Step 6: Написать обёртку и LaunchAgent**
 
 ```bash
 # deploy/macos/hermes_pull_offsite.sh
 #!/usr/bin/env bash
+# The repository root is derived from this file's own location: a path in
+# a plist's environment goes stale the moment the checkout moves.
 set -euo pipefail
-REPO="${HERMES_REPO:-/Users/romanmizanov/Documents/Hermes}"
+umask 0077
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO"
 exec "$REPO/.venv/bin/python" -m hermes_backup.offsite_pull "$@"
 ```
 
@@ -4288,11 +4583,6 @@ exec "$REPO/.venv/bin/python" -m hermes_backup.offsite_pull "$@"
     <string>/bin/bash</string>
     <string>/Users/romanmizanov/Documents/Hermes/deploy/macos/hermes_pull_offsite.sh</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PYTHONPATH</key>
-    <string>/Users/romanmizanov/Documents/Hermes</string>
-  </dict>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key><integer>6</integer>
@@ -4306,33 +4596,7 @@ exec "$REPO/.venv/bin/python" -m hermes_backup.offsite_pull "$@"
 </plist>
 ```
 
-- [ ] **Step 7: Проверить plist тестом**
-
-```python
-# добавить в tests/backup/test_offsite_pull.py
-import plistlib
-from pathlib import Path
-
-PLIST = Path(__file__).resolve().parents[2] / "deploy" / "macos" / "com.hermes.offsite-pull.plist"
-
-
-def test_launch_agent_runs_daily_and_names_its_logs():
-    data = plistlib.loads(PLIST.read_bytes())
-    assert data["Label"] == "com.hermes.offsite-pull"
-    assert data["StartCalendarInterval"] == {"Hour": 6, "Minute": 0}
-    assert data["StandardErrorPath"].endswith("pull.err.log")
-
-
-def test_launch_agent_has_no_secrets():
-    text = PLIST.read_text()
-    assert "sk-" not in text
-    assert "TOKEN" not in text
-```
-
-Run: `.venv/bin/python -m pytest tests/backup/test_offsite_pull.py -v`
-Expected: PASS, 8 тестов.
-
-- [ ] **Step 8: Коммит**
+- [ ] **Step 7: Коммит**
 
 ```bash
 chmod +x deploy/macos/hermes_pull_offsite.sh
@@ -4340,6 +4604,7 @@ git add hermes_backup/filevault.py hermes_backup/offsite_pull.py deploy/macos/ \
         tests/backup/test_filevault.py tests/backup/test_offsite_pull.py
 git commit -m "feat(backup): pull the off-site copy behind a FileVault gate"
 ```
+
 
 ---
 
