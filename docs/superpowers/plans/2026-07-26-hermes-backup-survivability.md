@@ -1707,6 +1707,47 @@ git commit -m "feat(backup): record run outcomes in status files"
 через `yaml.safe_load`. Архив с пойманным на середине записи `config.yaml` не
 должен публиковаться ни при каких условиях.
 
+**Второй обязательный критерий: закрыть асимметрию `format_state`.** Сейчас
+`parse_state` проверяет строковые значения регуляркой `_SAFE_STR`, а
+`format_state` пишет их без проверки. `HERMES_IMAGE_REF` и `HERMES_GIT_SHA`
+приходят из вывода `docker inspect` и `git`, то есть извне: значение с
+пробелом или переводом строки сейчас упадёт не при записи, а позже в
+`_self_check`, с невнятной жалобой на неизвестный ключ. Добавить в
+`hermes_backup/state.py`:
+
+```python
+def format_state(values: Mapping[str, int | str]) -> str:
+    missing = ALL_KEYS - set(values)
+    if missing:
+        raise StateError(f"missing key: {sorted(missing)[0]}")
+    unknown = set(values) - ALL_KEYS
+    if unknown:
+        raise StateError(f"unknown key: {sorted(unknown)[0]}")
+    for key in STR_KEYS:
+        # Values arrive from `docker inspect` and `git`: reject a bad one
+        # where it is produced, not three steps later in the self-check.
+        if not _SAFE_STR.match(str(values[key])):
+            raise StateError(f"{key} has an unsafe value")
+    for key in INT_KEYS:
+        if not isinstance(values[key], int) or isinstance(values[key], bool):
+            raise StateError(f"{key} expects an integer")
+    return "".join(f"{key}={values[key]}\n" for key in sorted(values))
+```
+
+и тест в `tests/backup/test_state.py`:
+
+```python
+def test_format_rejects_an_unsafe_string_value():
+    hostile = dict(VALID, HERMES_IMAGE_REF="hermes:latest\nEXPECTED_SKILLS=0")
+    with pytest.raises(StateError, match="HERMES_IMAGE_REF"):
+        format_state(hostile)
+
+
+def test_format_rejects_a_non_integer_count():
+    with pytest.raises(StateError, match="EXPECTED_SKILLS"):
+        format_state(dict(VALID, EXPECTED_SKILLS="78"))
+```
+
 - [ ] **Step 1: Написать падающий тест**
 
 ```python
