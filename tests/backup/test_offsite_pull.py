@@ -290,3 +290,18 @@ def test_an_unparsable_created_at_is_reported(tmp_path):
 
     with pytest.raises(RuntimeError, match="created_at_invalid"):
         check_freshness(root, 26)
+
+
+def test_non_utf8_state_is_refused_not_raised(tmp_path):
+    """Corrupted bytes must fail the check, not crash the caller."""
+    directory = _make_backup(tmp_path / "daily-x")
+    (directory / "STATE").write_bytes(b"CREATED_AT=2026-07-26T03:15:00Z\n\xff\xfe\n")
+    digest = hashlib.sha256((directory / "STATE").read_bytes()).hexdigest()
+    manifest = [
+        f"{digest}  STATE" if line.endswith("  STATE") else line
+        for line in (directory / "SHA256SUMS").read_text().splitlines()
+    ]
+    (directory / "SHA256SUMS").write_text("\n".join(manifest) + "\n")
+
+    with pytest.raises(RuntimeError, match="unreadable STATE"):
+        verify_backup(directory)

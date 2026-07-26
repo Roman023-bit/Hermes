@@ -4364,6 +4364,20 @@ def _ssh_command(key: Path) -> str:
     )
 
 
+def _read_text(path: Path) -> str:
+    """Read a backup file as text, refusing rather than raising.
+
+    These bytes arrived over the network: a truncated or corrupted file can
+    be invalid UTF-8, and a UnicodeDecodeError escaping from here would take
+    down whichever caller asked — including the status summary, whose whole
+    job is to describe a broken backup instead of dying with it.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise RuntimeError(f"unreadable {path.name}: {error}") from error
+
+
 def verify_backup(directory: Path) -> dict:
     """Prove the directory is a complete, self-consistent backup.
 
@@ -4380,7 +4394,7 @@ def verify_backup(directory: Path) -> dict:
             raise RuntimeError(f"not a regular file: {entry.name}")
 
     listed: set[str] = set()
-    for line in (directory / MANIFEST_NAME).read_text(encoding="utf-8").splitlines():
+    for line in _read_text(directory / MANIFEST_NAME).splitlines():
         digest, separator, name = line.partition("  ")
         if not separator or not _DIGEST.match(digest):
             raise RuntimeError(f"manifest line malformed: {line!r}")
@@ -4395,7 +4409,7 @@ def verify_backup(directory: Path) -> dict:
         raise RuntimeError(f"manifest incomplete: missing {sorted(BACKUP_FILES - {MANIFEST_NAME} - listed)}")
 
     try:
-        return parse_state((directory / "STATE").read_text(encoding="utf-8"))
+        return parse_state(_read_text(directory / "STATE"))
     except StateError as error:
         raise RuntimeError(f"state_invalid {error}") from error
 

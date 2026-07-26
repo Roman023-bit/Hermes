@@ -83,3 +83,18 @@ def test_wrapper_locates_the_repository_relative_to_itself():
     assert 'cd "$REPO"' in text
     assert ".venv/bin/python" in text
     assert "HERMES_REPO" not in text
+
+
+def test_a_backup_with_corrupted_bytes_is_reported_not_fatal(tmp_path):
+    """The summary exists to describe broken backups, so it must survive one."""
+    from hermes_backup.hashing import write_sha256sums
+
+    root = tmp_path / "offsite"
+    directory = _make_backup(root / f"daily-{STAMP}")
+    (directory / "STATE").write_bytes(b"CREATED_AT=2026-07-26T03:15:00Z\n\xff\xfe\n")
+    write_sha256sums(directory)
+
+    text = summary(root, tmp_path / "status", tmp_path / "network.lock")
+
+    assert "UNUSABLE" in text
+    assert "unreadable STATE" in text
