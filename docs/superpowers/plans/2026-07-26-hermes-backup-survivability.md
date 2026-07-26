@@ -1958,7 +1958,7 @@ class FileLock:
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_locks.py -v`
-Expected: PASS, 7 тестов.
+Expected: PASS, 9 тестов.
 
 - [ ] **Step 5: Коммит**
 
