@@ -1142,8 +1142,11 @@ Model cache можно не включать в off-site backup: он восст
 Цифровой мозг на Mac
    ├── локальный kf update
    └── filtered rsync по SSH
-          └── SHA-манифест совпал
-                 └── kf update на Aeza
+          └── incoming-sources на Aeza
+                 └── SHA-манифест совпал
+                        └── общий lock с backup
+                               ├── atomic mirror в production sources
+                               └── kf update на Aeza
 ```
 
 PostgreSQL и Qdrant между машинами не копируются. Каждая фабрика строит свой
@@ -1184,6 +1187,13 @@ Documents блокируется TCC с `Operation not permitted`.
 Серверный update не запускается, пока локальный и удалённый manifests не
 совпадут побайтово.
 
+Rsync никогда не пишет прямо в production source tree. Он заполняет
+`/srv/knowledge-factory/data/incoming-sources`; затем server wrapper под
+`knowledge-factory-update.lock` зеркалирует incoming в
+`/srv/knowledge-factory/data/sources` и запускает индексатор. Ежедневный backup
+берёт тот же lock, поэтому не может сохранить новые документы со старым
+PostgreSQL/Qdrant индексом.
+
 Удаление включено через `--delete-delay`, но fail-closed:
 
 - источник обязан содержать карту базы и минимум 50 поддерживаемых файлов;
@@ -1202,14 +1212,16 @@ Documents блокируется TCC с `Operation not permitted`.
 Dispatcher `/usr/local/sbin/kf-sync-dispatch` разрешает только:
 
 1. принимающий rsync строго в
-   `/srv/knowledge-factory/data/sources/`;
+   `/srv/knowledge-factory/data/incoming-sources/`;
 2. `kf-manifest`;
 3. `kf-update` через единственную sudo-команду
    `/usr/local/sbin/kf-update-production`.
 
 Произвольная команда возвращает exit code 126. Wrapper обновления использует
 `flock`, проверяет Compose, source count, последний статус update и полный
-production healthcheck.
+production healthcheck. Занятый lock возвращает exit code 75, поэтому
+LaunchAgent не выдаёт пропущенный update за успешную синхронизацию и повторяет
+цикл через 10 минут.
 
 ### 24.4. Подтверждённые сценарии
 
@@ -1222,6 +1234,7 @@ production healthcheck.
 - 11 удалений при лимите 10 остановлены до изменения сервера;
 - недоступная Aeza завершает цикл ошибкой до локального update/rsync;
 - параллельный запуск пропускается по lock;
+- серверный update при занятом backup/update lock возвращает 75;
 - LaunchAgent прошёл реальный цикл с exit code 0.
 
 ### 24.5. Проверка и rollback
