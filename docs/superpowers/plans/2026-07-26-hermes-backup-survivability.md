@@ -6052,11 +6052,13 @@ git branch kf-main "$SPLIT"
 rm -f /tmp/kf-deploy.bundle
 git bundle create /tmp/kf-deploy.bundle kf-main
 git bundle verify /tmp/kf-deploy.bundle
-LOCAL_SHA="$(shasum -a 256 /tmp/kf-deploy.bundle | awk '{print $1}')"
-echo "LOCAL_SHA=$LOCAL_SHA"
-```
 
-`LOCAL_SHA` понадобится в Step A3 — сохранить значение.
+# На диск, а не в переменную: A3 — отдельный вызов shell, переменная до него
+# не доживёт.
+shasum -a 256 /tmp/kf-deploy.bundle | awk '{print $1}' \
+  > /tmp/kf-deploy.bundle.sha256
+cat /tmp/kf-deploy.bundle.sha256
+```
 
 - [ ] **Step A2: Остановить таймер, отказавшись работать при активном drill**
 
@@ -6082,6 +6084,7 @@ EOF
 scp -i ~/.ssh/aeza_hermes /tmp/kf-deploy.bundle \
   root@138.124.108.97:/srv/knowledge-factory/staging/kf-deploy.bundle.incoming
 
+LOCAL_SHA="$(cat /tmp/kf-deploy.bundle.sha256)"
 ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 "LOCAL_SHA='$LOCAL_SHA' bash -s" <<'EOF'
 set -euo pipefail
 cd /srv/knowledge-factory/staging
@@ -6166,8 +6169,11 @@ echo "Result=$result ExecMainStatus=$status Invocation=$invocation"
 test "$result" = success
 test "$status" = 0
 
-journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --no-pager | tail -20
-journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --no-pager | grep -q restore_drill_OK
+# Журнал читается один раз в переменную: `journalctl | grep -q` под pipefail
+# может упасть от SIGPIPE, когда grep выходит по первому совпадению.
+log="$(journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --no-pager)"
+printf '%s\n' "$log" | tail -20
+grep -Fq restore_drill_OK <<<"$log"
 echo "drill прошёл на новой версии"
 EOF
 ```
@@ -6227,8 +6233,8 @@ if git show-ref --verify --quiet refs/heads/kf-main; then
   echo "ветка kf-main не удалилась" >&2
   exit 1
 fi
-rm -f /tmp/kf-deploy.bundle
-echo "временная ветка и локальный bundle убраны"
+rm -f /tmp/kf-deploy.bundle /tmp/kf-deploy.bundle.sha256
+echo "временная ветка, bundle и файл контрольной суммы убраны"
 ```
 
 - [ ] **Step A9: Установить исправленные скрипты на Mac**
