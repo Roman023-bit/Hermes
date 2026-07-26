@@ -104,7 +104,7 @@ def snapshot_command(
     ]
 
 
-def _setpriv_runner(
+def setpriv_runner(
     uid: int, gid: int, data: Path, dest: Path, names: Sequence[str]
 ) -> None:
     result = subprocess.run(
@@ -200,7 +200,7 @@ def run(
     snapshot_runner=None,
 ) -> Path:
     settings = settings or BackupSettings(**DEFAULTS)
-    runner = snapshot_runner or _setpriv_runner
+    runner = snapshot_runner or setpriv_runner
     paths = database_paths(data)
     uid, gid = require_single_owner(paths)
 

@@ -3939,7 +3939,7 @@ WantedBy=timers.target
 - [ ] **Step 7: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup -v`
-Expected: PASS — 18 тестов Task 12 плюс весь предыдущий набор.
+Expected: PASS — 17 тестов Task 12 плюс весь предыдущий набор.
 
 - [ ] **Step 8: Коммит**
 

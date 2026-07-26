@@ -1,0 +1,10 @@
+[Unit]
+Description=Hermes full local archive
+After=docker.service
+
+[Service]
+Type=oneshot
+UMask=0077
+PrivateTmp=true
+ExecStart=/srv/hermes/app/deploy/beget/backup.sh
+SuccessExitStatus=75

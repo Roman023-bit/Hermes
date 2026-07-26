@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes full archive at 04:15 UTC
+
+[Timer]
+OnCalendar=*-*-* 04:15:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
