@@ -1702,6 +1702,11 @@ git commit -m "feat(backup): record run outcomes in status files"
 - Consumes: `staging.stabilized_copy`, `sqlite_snapshot.*`, `inventory.write_inventory/write_exclusions`, `counters.*`, `state.format_state`, `archive.create`, `hashing.write_sha256sums`, `status.write_status/status_line`, `config.*`.
 - Produces: `run(data: Path, root: Path, *, rsync: str = "rsync") -> Path` — возвращает путь опубликованного каталога; `main(argv: list[str] | None = None) -> int`; коды выхода `0`, `1`, `75`.
 
+**Обязательный критерий приёмки:** структурированные файлы staging разбираются
+**до** публикации — `cron/jobs.json` через `count_cron_jobs`, `config.yaml`
+через `yaml.safe_load`. Архив с пойманным на середине записи `config.yaml` не
+должен публиковаться ни при каких условиях.
+
 - [ ] **Step 1: Написать падающий тест**
 
 ```python
@@ -1800,6 +1805,25 @@ def test_partial_directory_is_removed_when_a_step_fails(tmp_path, monkeypatch):
 
     assert not list(root.glob("daily-*"))
     assert not list(root.glob(".daily-*"))
+
+
+def test_torn_config_yaml_never_reaches_the_archive(tmp_path):
+    data = _fixture_tree(tmp_path)
+    (data / "config.yaml").write_text("model: [unclosed\n")
+    root = tmp_path / "essential"
+
+    with pytest.raises(RuntimeError):
+        run(data, root)
+
+    assert not list(root.glob("daily-*"))
+    assert not list(root.glob(".daily-*"))
+
+
+def test_empty_config_yaml_is_rejected(tmp_path):
+    data = _fixture_tree(tmp_path)
+    (data / "config.yaml").write_text("")
+    with pytest.raises(RuntimeError, match="config_yaml"):
+        run(data, tmp_path / "essential")
 
 
 def test_previous_backup_survives_a_failed_run(tmp_path, monkeypatch):
@@ -1904,6 +1928,7 @@ def run(data: Path, root: Path, *, rsync: str = "rsync", repo: Path | None = Non
         stabilized_copy(data, staging, rsync=rsync)
         if _tree_bytes(staging) > MAX_STAGING_BYTES:
             raise RuntimeError("staging_too_large")
+        _validate_structured(staging)
 
         databases = {}
         for name in ("state.db", "kanban.db"):
@@ -1958,6 +1983,22 @@ def run(data: Path, root: Path, *, rsync: str = "rsync", repo: Path | None = Non
     return published
 
 
+def _validate_structured(staging: Path) -> None:
+    """A file caught mid-write must never reach the archive.
+
+    The lock stops other backups, not Hermes, so staging can hold a
+    half-written config; parsing it here is the last gate before publish.
+    """
+    import yaml
+
+    try:
+        parsed = yaml.safe_load((staging / "config.yaml").read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise RuntimeError(f"config_yaml_unparsable: {error}") from error
+    if not parsed:
+        raise RuntimeError("config_yaml_empty")
+
+
 def _self_check(directory: Path) -> None:
     from hermes_backup.archive import validate
     from hermes_backup.state import parse_state
@@ -2003,7 +2044,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_essential_backup.py -v`
-Expected: PASS, 5 тестов.
+Expected: PASS, 7 тестов.
 
 - [ ] **Step 5: Написать обёртку и systemd-юниты**
 
@@ -2073,7 +2114,7 @@ def test_wrapper_takes_the_shared_lock():
 ```
 
 Run: `.venv/bin/python -m pytest tests/backup/test_essential_backup.py -v`
-Expected: PASS, 7 тестов.
+Expected: PASS, 9 тестов.
 
 - [ ] **Step 7: Коммит**
 
@@ -3562,14 +3603,12 @@ Task 15; безопасность (`source STATE` в KF, валидация tar,
 Task 16, 7, 13, 17; расписание → Task 11, 12, 13, 14, 18; предусловие
 FileVault → Task 1.
 
-**Расхождение, которое стоит знать.** Спека требует парсить структурированные
-файлы staging до публикации. В Task 11 это `cron/jobs.json` (через
-`count_cron_jobs`, который валит прогон на битом JSON) и `config.yaml`, чей
-YAML разбирается в drill'е (Task 14), а на сервере попадает в staging без
-разбора. PyYAML на сервере есть (6.0.1), поэтому проверку можно поднять в
-Task 11 одной строкой `yaml.safe_load` перед сборкой архива — исполнителю
-стоит это сделать, отдельной задачей не выделено только чтобы не плодить
-дубль логики.
+**Структурированные файлы проверяются на сервере.** Спека требует разбирать их
+до публикации, и это обязательный критерий приёмки Task 11, а не пожелание:
+`cron/jobs.json` — через `count_cron_jobs`, `config.yaml` — через
+`yaml.safe_load` по staging-копии. PyYAML на Aeza есть (6.0.1). Задача не
+считается принятой, если пойманный на середине записи `config.yaml` попадает
+в архив.
 
 **Placeholder-скан.** «TBD», «TODO», «add error handling» в плане нет; каждый
 шаг с кодом содержит код целиком.
