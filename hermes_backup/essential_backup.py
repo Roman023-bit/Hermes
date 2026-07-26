@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,27 +154,19 @@ def _tree_bytes(root: Path) -> int:
     return total
 
 
-def _grant_traversal(partial: Path, snapshots: Path, uid: int, gid: int) -> None:
-    """Let the unprivileged snapshot child reach its own directory.
+def _make_snapshot_dir(uid: int, gid: int) -> Path:
+    """A directory the unprivileged snapshot child can actually reach.
 
-    The child runs as the Hermes uid, so a 0700 root:root parent would
-    deny it before SQLite is even opened. 0710 with the child's group
-    grants traversal and nothing else: the directory stays unreadable and
-    unlistable, and the grant lasts only while the snapshot runs.
+    It cannot live inside the backup root: /srv/hermes/backups and its
+    essential/ subdirectory are 0700 root:root, so no permission granted
+    on the leaf would help — the path above it is already closed. Opening
+    those directories up would widen far more than the snapshot needs.
     """
-    if os.geteuid() != 0:
-        return
-    os.chown(snapshots, uid, gid)
+    snapshots = Path(tempfile.mkdtemp(prefix="hermes-essential-snapshots-"))
     snapshots.chmod(0o700)
-    os.chown(partial, 0, gid)
-    partial.chmod(0o710)
-
-
-def _revoke_traversal(partial: Path) -> None:
-    if os.geteuid() != 0:
-        return
-    os.chown(partial, 0, 0)
-    partial.chmod(0o700)
+    if os.geteuid() == 0:
+        os.chown(snapshots, uid, gid)
+    return snapshots
 
 
 def _validate_structured(staging: Path) -> None:
@@ -221,7 +214,7 @@ def run(
         raise RuntimeError(f"insufficient_disk_space: free={free} needed={needed}")
 
     staging = partial / "staging"
-    snapshots = partial / "snapshots"
+    snapshots: Path | None = None
     if partial.exists():
         shutil.rmtree(partial)
     partial.mkdir(parents=True, mode=0o700)
@@ -234,14 +227,8 @@ def run(
             raise RuntimeError("insufficient_disk_space_for_archive")
         _validate_structured(staging)
 
-        snapshots.mkdir(mode=0o700)
-        _grant_traversal(partial, snapshots, uid, gid)
-        try:
-            runner(uid, gid, data, snapshots, DATABASES)
-        finally:
-            # Give the private directory back even when the child failed:
-            # a group-traversable partial must not outlive the snapshot.
-            _revoke_traversal(partial)
+        snapshots = _make_snapshot_dir(uid, gid)
+        runner(uid, gid, data, snapshots, DATABASES)
         missing = [name for name in DATABASES if not (snapshots / name).exists()]
         if missing:
             raise RuntimeError(f"snapshot_missing: {missing}")
@@ -260,6 +247,7 @@ def run(
             }
             shutil.move(str(source), str(staging / name))
         shutil.rmtree(snapshots)
+        snapshots = None
 
         totals = write_inventory(staging, partial / "INVENTORY.jsonl")
         exclusions = write_exclusions(data, partial / "EXCLUSIONS.jsonl")
@@ -300,6 +288,11 @@ def run(
     except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
         raise
+    finally:
+        # Snapshots hold a full copy of both databases: never leave them
+        # behind, whichever way this run ended.
+        if snapshots is not None:
+            shutil.rmtree(snapshots, ignore_errors=True)
     _prune(root, settings.retention_server)
     return published
 

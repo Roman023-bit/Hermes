@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import stat
 import tarfile
 from pathlib import Path
 
@@ -208,57 +209,50 @@ def test_split_ownership_fails_closed(tmp_path, monkeypatch):
         require_single_owner([first, second])
 
 
-def test_snapshot_child_can_traverse_the_partial_directory(tmp_path, monkeypatch):
-    """A 0700 root:root parent would deny the unprivileged child."""
-    import stat as stat_module
-
-    import hermes_backup.essential_backup as module
-
-    chowns: list[tuple[str, int, int]] = []
-    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(
-        module.os,
-        "chown",
-        lambda path, uid, gid: chowns.append((Path(path).name, uid, gid)),
-    )
-    seen: dict[str, int] = {}
+def test_snapshots_live_outside_the_root_only_backup_tree(tmp_path):
+    """/srv/hermes/backups is 0700 root:root, so a snapshot directory
+    inside it is unreachable for the unprivileged child no matter what
+    permissions the leaf carries."""
+    seen: dict[str, Path] = {}
 
     def spy_runner(uid, gid, data, dest, names):
-        seen["partial"] = stat_module.S_IMODE(dest.parent.stat().st_mode)
-        seen["snapshots"] = stat_module.S_IMODE(dest.stat().st_mode)
+        seen["dest"] = Path(dest)
         _direct_runner(uid, gid, data, dest, names)
 
-    published = _run(
-        _fixture_tree(tmp_path), tmp_path / "essential", snapshot_runner=spy_runner
-    )
+    root = tmp_path / "essential"
+    published = _run(_fixture_tree(tmp_path), root, snapshot_runner=spy_runner)
 
-    assert seen["partial"] == 0o710
-    assert seen["snapshots"] == 0o700
-    assert any(name.startswith(".daily-") for name, _, _ in chowns)
-    # The traversal grant must not survive the snapshot step.
+    assert root not in seen["dest"].parents
+    assert seen["dest"].name.startswith("hermes-essential-snapshots-")
     assert published.stat().st_mode & 0o777 == 0o700
 
 
-def test_traversal_is_revoked_even_when_the_snapshot_fails(tmp_path, monkeypatch):
-    import hermes_backup.essential_backup as module
+def test_snapshot_directory_is_private_and_removed(tmp_path):
+    seen: dict[str, Path] = {}
 
-    revoked: list[str] = []
-    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(module.os, "chown", lambda *args: None)
-    real_revoke = module._revoke_traversal
-    monkeypatch.setattr(
-        module,
-        "_revoke_traversal",
-        lambda partial: (revoked.append(partial.name), real_revoke(partial))[1],
-    )
+    def spy_runner(uid, gid, data, dest, names):
+        seen["dest"] = Path(dest)
+        seen["mode"] = stat.S_IMODE(Path(dest).stat().st_mode)
+        _direct_runner(uid, gid, data, dest, names)
+
+    _run(_fixture_tree(tmp_path), tmp_path / "essential", snapshot_runner=spy_runner)
+
+    assert seen["mode"] == 0o700
+    # A full copy of both databases must not outlive the run.
+    assert not seen["dest"].exists()
+
+
+def test_snapshot_directory_is_removed_when_the_run_fails(tmp_path):
+    seen: dict[str, Path] = {}
 
     def broken(uid, gid, data, dest, names):
+        seen["dest"] = Path(dest)
         raise RuntimeError("snapshot_failed (1): boom")
 
     with pytest.raises(RuntimeError, match="snapshot_failed"):
         _run(_fixture_tree(tmp_path), tmp_path / "essential", snapshot_runner=broken)
 
-    assert revoked
+    assert not seen["dest"].exists()
 
 
 def test_snapshot_command_drops_privileges_to_the_file_owner():
@@ -306,6 +300,8 @@ def test_service_treats_lock_skip_as_success():
     unit = (DEPLOY / "systemd" / "hermes-essential-backup.service").read_text()
     assert "SuccessExitStatus=75" in unit
     assert "UMask=0077" in unit
+    # Snapshots land in /tmp now, so keep that /tmp private to the unit.
+    assert "PrivateTmp=true" in unit
 
 
 def test_wrapper_takes_the_shared_lock():
