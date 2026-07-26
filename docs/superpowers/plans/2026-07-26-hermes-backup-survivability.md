@@ -6453,32 +6453,154 @@ EOF
 Expected: `hermes_full_backup_OK`; в архиве ровно `state.db` и `kanban.db` без
 `-wal`/`-shm`; владельцы живых баз не изменились.
 
-- [ ] **Step B6: Установить таймеры и снять старый cron**
+- [ ] **Step B6: Установить и проверить таймеры**
+
+Порядок важен: сначала таймеры доказанно работают, и только потом, в B6a,
+снимается cron. Обратный порядок оставил бы полный архив без расписания вовсе,
+если установка юнитов не удалась.
 
 ```bash
 ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
 set -euo pipefail
+SRC=/srv/hermes/app/deploy/beget/systemd
+
+# 1. Сохранить текущий crontab: пока таймеры не подтверждены, он остаётся
+#    единственным носителем расписания. Ошибку чтения не глушим — здесь
+#    запись заведомо должна существовать.
+backup="/root/crontab.pre-hermes-timers-$(date -u +%Y%m%dT%H%M%SZ)"
+current="$(mktemp)"
+trap 'rm -f "$current"' EXIT
+if ! crontab -l >"$current"; then
+  echo "old_cron_read_FAILED" >&2
+  exit 1
+fi
+grep -Fq 'deploy/beget/backup.sh' "$current" || {
+  echo "old_cron_entry_missing" >&2
+  exit 1
+}
+install -m 0600 "$current" "$backup"
+echo "crontab сохранён: $backup ($(wc -l <"$backup") строк)"
+
+# 2. Проверить все четыре юнита одним вызовом: иначе timer проверяется в
+#    отрыве от своей service и связь между ними не подтверждается.
+systemd-analyze verify \
+  "$SRC/hermes-essential-backup.service" \
+  "$SRC/hermes-essential-backup.timer" \
+  "$SRC/hermes-full-backup.service" \
+  "$SRC/hermes-full-backup.timer"
+echo "systemd-analyze verify: все четыре юнита приняты"
+
+# 3. Установить и запустить.
 for unit in hermes-essential-backup hermes-full-backup; do
-  install -m 0644 "/srv/hermes/app/deploy/beget/systemd/$unit.service" /etc/systemd/system/
-  install -m 0644 "/srv/hermes/app/deploy/beget/systemd/$unit.timer" /etc/systemd/system/
+  install -m 0644 "$SRC/$unit.service" /etc/systemd/system/
+  install -m 0644 "$SRC/$unit.timer" /etc/systemd/system/
 done
 systemctl daemon-reload
 systemctl enable --now hermes-essential-backup.timer hermes-full-backup.timer
 
-# Снять старую cron-запись, не падая, если crontab пуст или отсутствует.
-current="$(crontab -l 2>/dev/null || true)"
-if printf '%s\n' "$current" | grep -q 'deploy/beget/backup.sh'; then
-  printf '%s\n' "$current" | grep -v 'deploy/beget/backup.sh' | crontab -
-  echo "cron-запись снята"
-else
-  echo "cron-записи не было"
-fi
-crontab -l 2>/dev/null || echo "crontab пуст"
+# 4. Доказать состояние и расписание каждого таймера.
+check_timer() {
+  unit="$1"; expected="$2"
+  systemctl is-enabled "$unit.timer" >/dev/null
+  systemctl is-active "$unit.timer" >/dev/null
+  # Вывод в переменную: `systemctl cat | grep -q` под pipefail может упасть
+  # от SIGPIPE, когда grep выходит по первому совпадению.
+  installed="$(systemctl cat "$unit.timer")"
+  grep -Fxq "$expected" <<<"$installed"
+  next="$(systemctl show -p NextElapseUSecRealtime --value "$unit.timer")"
+  # `test -n` пропустил бы литеральное "n/a", которое systemd печатает для
+  # таймера без запланированного срабатывания.
+  case "$next" in
+    ""|n/a)
+      echo "timer_next_elapse_FAILED: $unit.timer value=${next:-empty}" >&2
+      exit 1
+      ;;
+  esac
+  printf '%-30s %s/%s  %s  next=%s\n' "$unit.timer" \
+    "$(systemctl show -p ActiveState --value "$unit.timer")" \
+    "$(systemctl show -p SubState --value "$unit.timer")" \
+    "$expected" "$next"
+}
+check_timer hermes-essential-backup 'OnCalendar=*-*-* 03:15:00 UTC'
+check_timer hermes-full-backup      'OnCalendar=*-*-* 04:15:00 UTC'
+
 systemctl list-timers --no-pager | grep hermes
 EOF
 ```
 
-Расписание теперь ведут таймеры, и только они знают про `SuccessExitStatus=75`.
+Expected: `systemd-analyze verify` молчит; оба таймера `enabled` и `active`;
+установленное содержимое юнитов содержит именно `03:15:00 UTC` и
+`04:15:00 UTC`; следующее срабатывание у обоих непустое.
+
+- [ ] **Step B6a: Снять старую cron-запись**
+
+Только после того, как оба таймера подтверждены. Прежняя формулировка
+`crontab -l | grep -v … | crontab -` под `set -euo pipefail` **ломается ровно в
+том случае, ради которого писалась**: если удаляемая строка была единственной,
+`grep -v` не выводит ничего, возвращает 1, конвейер падает — и cron остаётся на
+месте.
+
+```bash
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+
+before="$(mktemp)"
+after="$(mktemp)"
+actual="$(mktemp)"
+err="$(mktemp)"
+trap 'rm -f "$before" "$after" "$actual" "$err"' EXIT
+
+# Ошибку чтения не глушим: `|| true` спрятал бы и «crontab отсутствует», и
+# настоящий сбой, а запись здесь обязана быть на месте.
+if ! crontab -l >"$before"; then
+  echo "old_cron_read_FAILED" >&2
+  exit 1
+fi
+grep -Fq 'deploy/beget/backup.sh' "$before" || {
+  echo "old_cron_entry_missing" >&2
+  exit 1
+}
+install -m 0600 "$before" \
+  "/root/crontab.pre-hermes-timers-$(date -u +%Y%m%dT%H%M%SZ)"
+
+# sed, а не grep -v: удаление единственной строки даёт пустой файл и код 0,
+# тогда как grep -v на пустом выводе возвращает 1.
+sed '\|deploy/beget/backup.sh|d' "$before" >"$after"
+crontab "$after"
+
+# Проверяем весь результат, а не только отсутствие строки: так же
+# доказывается, что остальные записи уцелели.
+if ! crontab -l >"$actual" 2>"$err"; then
+  # Единственный законный сбой чтения: на этом сервере удаляемая строка —
+  # единственная, и после удаления crontab становится пустым. Всё
+  # остальное — настоящая ошибка.
+  if grep -Fq "no crontab for" "$err"; then
+    : >"$actual"
+  else
+    echo "old_cron_verify_FAILED: $(cat "$err")" >&2
+    exit 1
+  fi
+fi
+if ! cmp -s "$after" "$actual"; then
+  echo "crontab_roundtrip_mismatch" >&2
+  diff -u "$after" "$actual" >&2 || true
+  exit 1
+fi
+if grep -Fq 'deploy/beget/backup.sh' "$actual"; then
+  echo "old_cron_removal_FAILED" >&2
+  exit 1
+fi
+echo "old_cron_removed_OK ($(wc -l <"$actual") строк осталось)"
+EOF
+```
+
+Expected: `old_cron_removed_OK (0 строк осталось)`. Проверено 2026-07-27:
+в crontab root ровно одна запись — та самая, — поэтому после удаления он
+становится пустым, и `crontab -l` у Vixie-cron может ответить ненулевым кодом с
+«no crontab for root». Этот один случай разбирается явно по тексту ошибки;
+любой другой сбой чтения валит шаг. `cmp` доказывает не только исчезновение
+строки, но и сохранность всех остальных. Расписание теперь ведут таймеры, и только они знают
+про `SuccessExitStatus=75`.
 
 #### Фаза C. Mac: лок, первый pull, drill, агенты
 
