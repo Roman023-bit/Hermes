@@ -3365,105 +3365,458 @@ git commit -m "feat(backup): publish the essential backup atomically on Aeza"
 
 ---
 
-### Task 12: Полный архив — общий лок и снимки вместо живых БД
+### Task 12: Полный архив — Python-логика, общий лок и снимки вместо живых БД
+
+Полный архив переезжает на ту же схему, что и essential: вся логика в
+тестируемом Python, `backup.sh` становится тонким запускателем. Иначе в bash
+пришлось бы воспроизвести определение владельца, `setpriv`, чтение настроек,
+атомарную запись статуса и `EXIT` trap — то есть ровно то, что уже написано и
+покрыто тестами.
 
 **Files:**
-- Modify: `deploy/beget/backup.sh`
-- Create: `deploy/beget/systemd/hermes-full-backup.service`, `deploy/beget/systemd/hermes-full-backup.timer`
-- Reuse: `hermes_backup/snapshot_cli.py` — создан в Task 11, здесь только вызывается
-- Test: `tests/backup/test_full_backup_script.py`
+- Create: `hermes_backup/full_backup.py`, `deploy/beget/systemd/hermes-full-backup.service`, `deploy/beget/systemd/hermes-full-backup.timer`
+- Modify: `deploy/beget/backup.sh` (становится обёрткой), `hermes_backup/essential_backup.py` (вынести общие помощники — см. Step 1)
+- Test: `tests/backup/test_full_backup.py`
 
 **Interfaces:**
-- Consumes: `hermes_backup.snapshot_cli`, созданный в Task 11.
-- Produces: изменённый `backup.sh`, который берёт `/run/lock/hermes-backup.lock`, исключает `state.db*`/`kanban.db*` и добавляет собственные снимки.
+- Consumes: `essential_backup.database_paths/require_single_owner/snapshot_command/setpriv_runner`, `config.load_settings`, `status.write_status/status_line`, `sqlite_snapshot.integrity_check`.
+- Produces: `hermes_backup/full_backup.py`: `run(data, backup_dir, *, settings=None, snapshot_runner=None) -> Path`; `main(argv=None) -> int`; коды выхода `0`, `1`, `75`.
 
-- [ ] **Step 1: Написать падающий тест**
+**Обязательные критерии приёмки:**
+
+1. **Снимки снимаются не от root.** Владелец `data`, обеих БД и всех
+   существующих `-wal`/`-shm` определяется и сверяется до снимка; каталог
+   снимков создаётся с `<uid>:<gid> 0700`; `snapshot_cli` запускается через
+   `setpriv --reuid --regid --clear-groups`; после снимка владельцы
+   проверяются повторно; при любом расхождении архив не публикуется.
+2. **Никакого `HERMES_BACKUP_KEEP`.** Ретенция читается из
+   `backup.retention_server` через `load_settings()`.
+3. **Статусы по спеке.** Общий `EXIT` trap в обёртке, строки
+   `hermes_full_backup_OK|FAILED|SKIPPED`, атомарный status-файл через
+   `status.write_status`. При сбое предыдущий архив и ретенция не трогаются.
+4. **Усиленная проверка.** `PrivateTmp=true` и `UMask=0077` в юните; тесты
+   проверяют `setpriv`, pre/post owner-check, отсутствие env-настройки и
+   наличие trap.
+
+- [ ] **Step 1: Сделать помощники снимков переиспользуемыми**
+
+В `hermes_backup/essential_backup.py` переименовать `_setpriv_runner` в
+`setpriv_runner` (публичное имя, его теперь импортирует второй потребитель) и
+оставить псевдоним `_setpriv_runner = setpriv_runner` не нужно — заменить
+единственное использование внутри `run()`. Ничего больше не меняется:
+`database_paths`, `require_single_owner`, `snapshot_command`,
+`_grant_traversal`, `_revoke_traversal` уже публичны или используются только
+внутри модуля.
+
+В `tests/backup/test_essential_backup.py` ничего менять не требуется.
+
+- [ ] **Step 2: Написать падающий тест**
 
 ```python
-# tests/backup/test_full_backup_script.py
+# tests/backup/test_full_backup.py
+import sqlite3
+import tarfile
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "beget" / "backup.sh"
-UNIT = Path(__file__).resolve().parents[2] / "deploy" / "beget" / "systemd" / "hermes-full-backup.service"
+import pytest
+
+from hermes_backup.full_backup import run
+from hermes_backup.sqlite_snapshot import snapshot
+from hermes_backup.status import read_status
+
+DEPLOY = Path(__file__).resolve().parents[2] / "deploy" / "beget"
 
 
-def test_live_databases_are_excluded_from_tar():
-    text = SCRIPT.read_text()
-    assert "--exclude=./state.db*" in text
-    assert "--exclude=./kanban.db*" in text
+def _direct_runner(uid, gid, data, dest, names):
+    """Tests cannot setpriv; take the snapshots in-process instead."""
+    for name in names:
+        snapshot(data / name, dest / name)
 
 
-def test_snapshots_are_taken_for_this_run():
-    text = SCRIPT.read_text()
-    assert "hermes_backup.snapshot_cli" in text
-    assert "snapshot_dir" in text
+def _fixture_tree(root):
+    data = root / "data"
+    (data / "cache").mkdir(parents=True)
+    (data / "cache" / "junk.bin").write_bytes(b"0" * 32)
+    (data / "sessions").mkdir()
+    (data / "sessions" / "sessions.json").write_text("{}")
+    (data / "config.yaml").write_text("model: opus\n")
+    for name in ("state.db", "kanban.db"):
+        connection = sqlite3.connect(data / name)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        connection.execute("INSERT INTO t (id) VALUES (1)")
+        connection.commit()
+        connection.close()
+    return data
 
 
-def test_shared_lock_is_taken():
-    text = SCRIPT.read_text()
-    assert "/run/lock/hermes-backup.lock" in text
-    assert "flock -n 9" in text
+def _run(data, backup_dir, **kwargs):
+    kwargs.setdefault("snapshot_runner", _direct_runner)
+    return run(data, backup_dir, **kwargs)
 
 
-def test_retention_floor_is_preserved():
-    text = SCRIPT.read_text()
-    assert 'KEEP="${HERMES_BACKUP_KEEP:-7}"' in text
-    assert '[ "$KEEP" -ge 1 ]' in text
+def test_archive_holds_snapshots_and_no_live_databases(tmp_path):
+    data = _fixture_tree(tmp_path)
+    archive = _run(data, tmp_path / "backups")
+
+    with tarfile.open(archive) as tar:
+        names = set(tar.getnames())
+    assert "./state.db" in names or "state.db" in names
+    assert "./kanban.db" in names or "kanban.db" in names
+    assert not any(name.endswith(("-wal", "-shm")) for name in names)
+    # The full archive keeps everything else, caches included.
+    assert any("cache/junk.bin" in name for name in names)
 
 
-def test_unit_treats_lock_skip_as_success():
-    unit = UNIT.read_text()
+def test_snapshot_in_the_archive_is_readable(tmp_path):
+    data = _fixture_tree(tmp_path)
+    archive = _run(data, tmp_path / "backups")
+
+    with tarfile.open(archive) as tar:
+        member = next(m for m in tar.getmembers() if m.name.endswith("state.db"))
+        extracted = tar.extractfile(member).read()
+    restored = tmp_path / "restored.db"
+    restored.write_bytes(extracted)
+    connection = sqlite3.connect(restored)
+    assert connection.execute("SELECT count(*) FROM t").fetchone()[0] == 1
+    connection.close()
+
+
+def test_retention_comes_from_config_not_the_environment(tmp_path, monkeypatch):
+    from hermes_backup.config import DEFAULTS, BackupSettings
+
+    monkeypatch.setenv("HERMES_BACKUP_KEEP", "1")
+    data = _fixture_tree(tmp_path)
+    backups = tmp_path / "backups"
+    settings = BackupSettings(**{**DEFAULTS, "retention_server": 3})
+    for _ in range(5):
+        _run(data, backups, settings=settings)
+
+    assert len(list(backups.glob("hermes-*.tar.gz"))) == 3
+
+
+def test_retention_never_empties_the_directory(tmp_path):
+    from hermes_backup.config import DEFAULTS, BackupSettings
+
+    data = _fixture_tree(tmp_path)
+    backups = tmp_path / "backups"
+    settings = BackupSettings(**{**DEFAULTS, "retention_server": 1})
+    _run(data, backups, settings=settings)
+    _run(data, backups, settings=settings)
+
+    assert len(list(backups.glob("hermes-*.tar.gz"))) == 1
+
+
+def test_a_failing_snapshot_leaves_the_previous_archive_alone(tmp_path):
+    data = _fixture_tree(tmp_path)
+    backups = tmp_path / "backups"
+    first = _run(data, backups)
+
+    def broken(uid, gid, source, dest, names):
+        raise RuntimeError("snapshot_failed (1): boom")
+
+    with pytest.raises(RuntimeError, match="snapshot_failed"):
+        _run(data, backups, snapshot_runner=broken)
+
+    assert first.exists()
+    assert not list(backups.glob("*.partial"))
+
+
+def test_missing_database_fails_before_any_archive_is_written(tmp_path):
+    data = _fixture_tree(tmp_path)
+    (data / "kanban.db").unlink()
+    backups = tmp_path / "backups"
+
+    with pytest.raises(RuntimeError, match="missing_database"):
+        _run(data, backups)
+
+    assert not backups.exists() or not list(backups.glob("hermes-*.tar.gz"))
+
+
+def test_owner_mismatch_after_the_snapshot_fails_closed(tmp_path, monkeypatch):
+    """The child touched the live databases: prove it left them alone."""
+    import hermes_backup.full_backup as module
+
+    data = _fixture_tree(tmp_path)
+    calls = {"n": 0}
+    real = module.require_single_owner
+
+    def drifting(paths):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("owner_mismatch: after snapshot")
+        return real(paths)
+
+    monkeypatch.setattr(module, "require_single_owner", drifting)
+    with pytest.raises(RuntimeError, match="owner_mismatch"):
+        _run(data, tmp_path / "backups")
+    assert calls["n"] == 2
+
+
+def test_status_records_success(tmp_path):
+    data = _fixture_tree(tmp_path)
+    status_dir = tmp_path / "status"
+    from hermes_backup.full_backup import main
+
+    code = main(
+        [
+            "--data", str(data),
+            "--backup-dir", str(tmp_path / "backups"),
+            "--status-dir", str(status_dir),
+            "--config", str(tmp_path / "absent.yaml"),
+            "--in-process-snapshots",
+        ]
+    )
+
+    assert code == 0
+    record = read_status(status_dir, "full_backup")
+    assert record["outcome"] == "OK"
+    assert record["backup_path"].endswith(".tar.gz")
+
+
+def test_status_records_failure(tmp_path):
+    data = _fixture_tree(tmp_path)
+    (data / "state.db").unlink()
+    status_dir = tmp_path / "status"
+    from hermes_backup.full_backup import main
+
+    code = main(
+        [
+            "--data", str(data),
+            "--backup-dir", str(tmp_path / "backups"),
+            "--status-dir", str(status_dir),
+            "--config", str(tmp_path / "absent.yaml"),
+            "--in-process-snapshots",
+        ]
+    )
+
+    assert code == 1
+    record = read_status(status_dir, "full_backup")
+    assert record["outcome"] == "FAILED"
+    assert "missing_database" in record["reason"]
+
+
+def test_wrapper_is_a_thin_launcher_with_a_trap():
+    wrapper = (DEPLOY / "backup.sh").read_text()
+    assert "flock -n 9" in wrapper
+    assert "/run/lock/hermes-backup.lock" in wrapper
+    assert "hermes_backup.full_backup" in wrapper
+    assert "trap" in wrapper
+    assert "hermes_full_backup_SKIPPED" in wrapper
+    # Behaviour lives in config.yaml, not in the environment.
+    assert "HERMES_BACKUP_KEEP" not in wrapper
+
+
+def test_full_backup_uses_setpriv_for_snapshots():
+    source = (Path(__file__).resolve().parents[2] / "hermes_backup" / "full_backup.py").read_text()
+    assert "setpriv_runner" in source
+    assert "require_single_owner" in source
+
+
+def test_unit_is_hardened():
+    unit = (DEPLOY / "systemd" / "hermes-full-backup.service").read_text()
     assert "SuccessExitStatus=75" in unit
     assert "UMask=0077" in unit
+    assert "PrivateTmp=true" in unit
 ```
 
-- [ ] **Step 2: Прогнать тест и убедиться, что он падает**
+- [ ] **Step 3: Прогнать тест и убедиться, что он падает**
 
-Run: `.venv/bin/python -m pytest tests/backup/test_full_backup_script.py -v`
-Expected: FAIL — ни исключений, ни лока в скрипте пока нет.
+Run: `.venv/bin/python -m pytest tests/backup/test_full_backup.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'hermes_backup.full_backup'`
 
-- [ ] **Step 3: Изменить `backup.sh`**
+- [ ] **Step 4: Реализовать `full_backup.py`**
 
-Заменить блок создания архива (строки 21–48 текущего файла) на:
+```python
+# hermes_backup/full_backup.py
+"""The full local archive on Aeza: everything, with consistent databases.
+
+This tier is the safety net for files the essential classification never
+knew about, so it keeps caches and junk. What it must not keep is a live
+SQLite file: the databases are replaced by snapshots taken by an
+unprivileged child, exactly as the essential backup does.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+from hermes_backup import config
+from hermes_backup.config import DEFAULTS, BackupSettings, load_settings
+from hermes_backup.essential_backup import (
+    DATABASES,
+    database_paths,
+    require_single_owner,
+    setpriv_runner,
+)
+from hermes_backup.sqlite_snapshot import integrity_check, snapshot
+from hermes_backup.status import status_line, write_status
+
+
+def _in_process_runner(uid, gid, data: Path, dest: Path, names) -> None:
+    for name in names:
+        snapshot(data / name, dest / name)
+
+
+def run(
+    data: Path,
+    backup_dir: Path,
+    *,
+    settings: BackupSettings | None = None,
+    snapshot_runner=None,
+) -> Path:
+    settings = settings or BackupSettings(**DEFAULTS)
+    runner = snapshot_runner or setpriv_runner
+    paths = database_paths(data)
+    uid, gid = require_single_owner(paths)
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir.chmod(0o700)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    archive = backup_dir / f"hermes-{stamp}.tar.gz"
+    partial = archive.with_suffix(".tar.gz.partial")
+
+    # PrivateTmp keeps this out of the host's /tmp; the child needs to own
+    # it, so it cannot live inside the root-only backup directory.
+    snapshots = Path(tempfile.mkdtemp(prefix="hermes-full-snapshots-"))
+    try:
+        import os
+
+        if os.geteuid() == 0:
+            os.chown(snapshots, uid, gid)
+        snapshots.chmod(0o700)
+        runner(uid, gid, data, snapshots, DATABASES)
+        missing = [name for name in DATABASES if not (snapshots / name).exists()]
+        if missing:
+            raise RuntimeError(f"snapshot_missing: {missing}")
+        for name in DATABASES:
+            integrity_check(snapshots / name)
+        # The child touched the live databases: prove it left them alone.
+        require_single_owner(paths)
+
+        result = subprocess.run(
+            [
+                "tar",
+                "-C",
+                str(data),
+                "--exclude=./state.db*",
+                "--exclude=./kanban.db*",
+                "-czf",
+                str(partial),
+                ".",
+                "-C",
+                str(snapshots),
+                *DATABASES,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        # GNU tar exits 1 when a file changed while being read, which is
+        # expected against a live Hermes; only >=2 is fatal.
+        if result.returncode >= 2:
+            raise RuntimeError(f"tar_failed ({result.returncode}): {result.stderr.strip()}")
+
+        verify = subprocess.run(
+            ["tar", "-tzf", str(partial)], capture_output=True, text=True, check=False
+        )
+        if verify.returncode != 0:
+            raise RuntimeError("archive_unreadable")
+        partial.replace(archive)
+        archive.chmod(0o600)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    finally:
+        shutil.rmtree(snapshots, ignore_errors=True)
+
+    _prune(backup_dir, settings.retention_server)
+    return archive
+
+
+def _prune(backup_dir: Path, keep: int) -> None:
+    # Never prune to nothing: if retention is misconfigured, keep history.
+    if keep < 1:
+        return
+    archives = sorted(backup_dir.glob("hermes-*.tar.gz"))
+    for stale in archives[: max(0, len(archives) - keep)]:
+        stale.unlink(missing_ok=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, default=config.SERVER_DATA)
+    parser.add_argument("--backup-dir", type=Path, default=config.SERVER_FULL_ROOT)
+    parser.add_argument("--status-dir", type=Path, default=config.SERVER_STATUS_DIR)
+    parser.add_argument("--config", type=Path, default=config.SERVER_CONFIG)
+    parser.add_argument(
+        "--in-process-snapshots",
+        action="store_true",
+        help="take snapshots without setpriv (tests only)",
+    )
+    args = parser.parse_args(argv)
+    runner = _in_process_runner if args.in_process_snapshots else None
+    try:
+        archive = run(
+            args.data,
+            args.backup_dir,
+            settings=load_settings(args.config),
+            snapshot_runner=runner,
+        )
+    except BaseException as error:  # noqa: BLE001 — status must always be emitted
+        write_status(args.status_dir, "full_backup", "FAILED", reason=str(error))
+        print(status_line("full_backup", "FAILED", str(error)), file=sys.stderr)
+        return 1
+    write_status(args.status_dir, "full_backup", "OK", backup_path=str(archive))
+    print(status_line("full_backup", "OK", f"path={archive}"))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 5: Заменить `backup.sh` на обёртку**
 
 ```bash
-install -d -m 0700 "$BACKUP_DIR"
+#!/usr/bin/env bash
+# Thin launcher for the full local archive. All behaviour lives in
+# hermes_backup.full_backup, where pytest covers it; this file only takes
+# the shared lock and guarantees a machine-readable status line.
+#
+#   /srv/hermes/app/deploy/beget/backup.sh
+#
+# Safe to run while the hermes container is up — it does not stop it.
+set -euo pipefail
+umask 0077
 
-# The shared lock keeps the essential backup and this archive apart, so a
-# snapshot pair can never straddle two different source trees.
-exec 9>/run/lock/hermes-backup.lock
+APP=/srv/hermes/app
+LOCK=/run/lock/hermes-backup.lock
+
+status=1
+# set -e can end the script before any status is printed; the trap makes
+# the machine-readable line unconditional.
+trap '[ "$status" -eq 0 ] || echo "hermes_full_backup_FAILED wrapper exit=$status" >&2' EXIT
+
+exec 9>"$LOCK"
 if ! flock -n 9; then
+  status=0
   echo "hermes_full_backup_SKIPPED locked"
   exit 75
 fi
 
-timestamp="$(date +%Y%m%d-%H%M%S)"
-archive="$BACKUP_DIR/hermes-${timestamp}.tar.gz"
-tmp_archive="${archive}.partial"
-
-# Live SQLite files are never tarred: this run takes its own consistent
-# snapshots and ships those instead. Reusing another run's snapshot is
-# forbidden — it would pair one tree with another tree's database.
-snapshot_dir="$(mktemp -d)"
-cleanup_snapshots() { rm -rf "$snapshot_dir"; }
-trap cleanup_snapshots EXIT
-PYTHONPATH=/srv/hermes/app /usr/bin/python3 -m hermes_backup.snapshot_cli \
-  --data "$DATA_DIR" --dest "$snapshot_dir" state.db kanban.db
-
-set +e
-tar -C "$DATA_DIR" \
-  --exclude=./state.db* \
-  --exclude=./kanban.db* \
-  -czf "$tmp_archive" . -C "$snapshot_dir" state.db kanban.db
-tar_status=$?
-set -e
+PYTHONPATH="$APP" /usr/bin/python3 -m hermes_backup.full_backup "$@"
+status=$?
+exit "$status"
 ```
 
-Остальная часть скрипта (проверка `tar -tzf`, `mv`, `chmod 600`, ретенция)
-остаётся без изменений; заменить финальные строки статуса на
-`echo "hermes_full_backup_OK: $archive"`.
-
-- [ ] **Step 4: Написать юниты**
+- [ ] **Step 6: Написать юниты**
 
 ```ini
 # deploy/beget/systemd/hermes-full-backup.service
@@ -3474,6 +3827,7 @@ After=docker.service
 [Service]
 Type=oneshot
 UMask=0077
+PrivateTmp=true
 ExecStart=/srv/hermes/app/deploy/beget/backup.sh
 SuccessExitStatus=75
 ```
@@ -3491,18 +3845,20 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-- [ ] **Step 5: Прогнать тесты**
+- [ ] **Step 7: Прогнать тесты**
 
-Run: `.venv/bin/python -m pytest tests/backup/test_full_backup_script.py -v`
-Expected: PASS, 5 тестов.
+Run: `.venv/bin/python -m pytest tests/backup -v`
+Expected: PASS — 13 тестов Task 12 плюс весь предыдущий набор.
 
-- [ ] **Step 6: Коммит**
+- [ ] **Step 8: Коммит**
 
 ```bash
-git add deploy/beget/backup.sh deploy/beget/systemd/hermes-full-backup.* \
-        tests/backup/test_full_backup_script.py
+git add hermes_backup/full_backup.py hermes_backup/essential_backup.py \
+        deploy/beget/backup.sh deploy/beget/systemd/hermes-full-backup.* \
+        tests/backup/test_full_backup.py
 git commit -m "fix(backup): stop tarring live SQLite files in the full archive"
 ```
+
 
 ---
 
@@ -4974,15 +5330,26 @@ Expected: у всех строк один и тот же владелец (се�
 root-овый `-wal` или `-shm` — понижение привилегий не сработало, и Hermes
 потеряет запись в свою базу.
 
-- [ ] **Step 7: Проверить, что полный архив больше не содержит живых БД**
+- [ ] **Step 7: Прогнать полный архив вручную и проверить его**
 
 ```bash
-ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 \
-  'latest=$(ls -1t /srv/hermes/backups/hermes-*.tar.gz | head -1); \
-   tar -tzf "$latest" | grep -E "state\.db|kanban\.db"'
+ssh -i ~/.ssh/aeza_hermes root@138.124.108.97 'bash -s' <<'EOF'
+set -euo pipefail
+/srv/hermes/app/deploy/beget/backup.sh
+latest=$(ls -1t /srv/hermes/backups/hermes-*.tar.gz | head -1)
+echo "архив: $latest"
+echo "--- базы в архиве:"
+tar -tzf "$latest" | grep -E "state\.db|kanban\.db" || true
+echo "--- владельцы живых баз после снимка:"
+stat -c "%U:%G %a %n" /srv/hermes/data /srv/hermes/data/state.db* /srv/hermes/data/kanban.db*
+EOF
 ```
 
-Expected: ровно `./state.db` и `./kanban.db` (снимки), без `-wal` и `-shm`.
+Expected: строка `hermes_full_backup_OK`; в архиве ровно два снимка
+(`./state.db` и `./kanban.db`) и ни одного `-wal`/`-shm`; владельцы живых баз и
+каталога данных — те же, что до прогона (сейчас `10000:10000`), ни одной записи
+с `root`. Появление root-овых sidecar-файлов означает, что `setpriv` не
+сработал и Hermes потеряет запись в свою БД.
 
 - [ ] **Step 8: Обновить документацию и закоммитить**
 
