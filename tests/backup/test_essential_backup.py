@@ -42,6 +42,11 @@ def _fixture_tree(root):
     (data / "cache" / "junk.bin").write_bytes(b"0" * 64)
     (data / "auth.json").write_text("{}")
     (data / "config.yaml").write_text("model: opus\n")
+    (data / ".env").write_text("TELEGRAM_TOKEN=x\n")
+    # Secrets are 0600 on the server; the drill rejects anything wider, so a
+    # fixture built under the default umask would not resemble production.
+    for secret in ("auth.json", "config.yaml", ".env", "sessions/sessions.json"):
+        (data / secret).chmod(0o600)
 
     for name in ("state.db", "kanban.db"):
         connection = sqlite3.connect(data / name)

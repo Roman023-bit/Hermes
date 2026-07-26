@@ -2615,6 +2615,11 @@ def _fixture_tree(root):
     (data / "cache" / "junk.bin").write_bytes(b"0" * 64)
     (data / "auth.json").write_text("{}")
     (data / "config.yaml").write_text("model: opus\n")
+    (data / ".env").write_text("TELEGRAM_TOKEN=x\n")
+    # Secrets are 0600 on the server; the drill rejects anything wider, so a
+    # fixture built under the default umask would not resemble production.
+    for secret in ("auth.json", "config.yaml", ".env", "sessions/sessions.json"):
+        (data / secret).chmod(0o600)
 
     for name in ("state.db", "kanban.db"):
         connection = sqlite3.connect(data / name)
@@ -4729,9 +4734,12 @@ def test_a_directory_that_cannot_be_removed_fails_the_drill(tmp_path, monkeypatc
     """The temporary tree holds live tokens: leaving it behind is a failure."""
     import hermes_backup.restore_drill as module
 
+    # Build the backup first: module.shutil is the shutil module itself, so
+    # stubbing rmtree would also stop the orchestrator cleaning its staging.
+    published = _published(tmp_path)
     monkeypatch.setattr(module.shutil, "rmtree", lambda *a, **k: None)
     with pytest.raises(DrillError, match="cleanup_failed"):
-        drill(_published(tmp_path))
+        drill(published)
 
 
 def test_stale_created_at_is_rejected(tmp_path):
@@ -4837,9 +4845,9 @@ def test_world_readable_secret_is_rejected(tmp_path):
 
 def test_world_readable_env_file_is_rejected(tmp_path):
     def loosen(tree: Path, published: Path) -> None:
-        secret = tree / ".env"
-        secret.write_text("TOKEN=x\n")
-        secret.chmod(0o644)
+        # Loosen the existing .env rather than adding one: a new file would
+        # change the inventory totals and fail that check first.
+        (tree / ".env").chmod(0o644)
 
     published = _rewrite(_published(tmp_path), loosen)
     with pytest.raises(DrillError, match="permissions_too_wide"):
