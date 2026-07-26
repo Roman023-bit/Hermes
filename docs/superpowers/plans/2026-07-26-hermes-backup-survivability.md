@@ -1634,7 +1634,7 @@ git commit -m "feat(backup): stabilize staging copies of a live tree"
 
 ---
 
-### Task 9: `locks.py` — локи с владельцем и корректным снятием stale
+### Task 9: `locks.py` — файловый лок через `fcntl.flock`
 
 **Files:**
 - Create: `hermes_backup/locks.py`
@@ -1642,64 +1642,146 @@ git commit -m "feat(backup): stabilize staging copies of a live tree"
 
 **Interfaces:**
 - Consumes: ничего.
-- Produces: `LockBusy(RuntimeError)`; `LockTimeout(RuntimeError)`; `class DirectoryLock` с методами `acquire(wait_seconds: int = 0)`, `release()`, поддержкой `with`, свойством `meta: dict`.
+- Produces: `LockBusy(RuntimeError)`; `LockTimeout(RuntimeError)`; `class FileLock` с `acquire(wait_seconds: int = 0)`, `release()`, поддержкой `with`; `held_by(path: Path) -> dict | None` — метаданные держателя, если лок занят, иначе `None`.
+
+**Почему не каталог-лок.** Протокол на `mkdir` имеет две гонки: между
+`mkdir()` и записью `meta.json` другой процесс видит лок без метаданных и
+может счесть его stale; между проверкой мёртвого PID и `rmdir` каталог успевает
+занять третий процесс, и удаление снимает чужой живой лок. `fcntl.flock` обеих
+гонок не имеет: лок привязан к открытому описанию файла и снимается ядром при
+смерти процесса, поэтому ручной stale-reclaim не нужен вовсе.
+
+**Обязательные критерии приёмки:**
+
+1. `network.lock` — постоянный обычный файл, который **никогда не удаляется**.
+2. `LOCK_EX | LOCK_NB` в цикле до дедлайна; `wait_seconds=0` даёт `LockBusy`
+   сразу, истёкшее положительное ожидание — `LockTimeout`.
+3. `meta.json` — отдельный sidecar, записываемый атомарно. Метаданные
+   информационные, источник истины — сам `flock`.
+4. `release()` освобождает только дескриптор этого экземпляра: чужой объект
+   `FileLock` на тот же путь снять лок не может.
 
 - [ ] **Step 1: Написать падающий тест**
 
 ```python
 # tests/backup/test_locks.py
+"""Lock behaviour is only meaningful across processes, so every contention
+test drives a real child process rather than a second object in-process."""
+
 import json
 import os
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
 
 import pytest
 
-from hermes_backup.locks import DirectoryLock, LockBusy
+from hermes_backup.locks import FileLock, LockBusy, LockTimeout, held_by
+
+REPO = Path(__file__).resolve().parents[2]
+
+HOLDER = textwrap.dedent(
+    """
+    import sys, time
+    sys.path.insert(0, {repo!r})
+    from pathlib import Path
+    from hermes_backup.locks import FileLock
+
+    lock = FileLock(Path(sys.argv[1]), owner="child")
+    lock.acquire()
+    print("held", flush=True)
+    time.sleep(60)
+    """
+)
 
 
-def test_second_holder_is_refused(tmp_path):
+def _holder(path: Path) -> subprocess.Popen:
+    process = subprocess.Popen(
+        [sys.executable, "-c", HOLDER.format(repo=str(REPO)), str(path)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout.readline().strip() == "held"
+    return process
+
+
+def test_second_process_cannot_take_a_held_lock(tmp_path):
     path = tmp_path / "network.lock"
-    with DirectoryLock(path, owner="hermes-pull"):
+    holder = _holder(path)
+    try:
         with pytest.raises(LockBusy):
-            DirectoryLock(path, owner="kf-pull").acquire()
+            FileLock(path, owner="hermes-pull").acquire()
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_killing_the_owner_frees_the_lock(tmp_path):
+    path = tmp_path / "network.lock"
+    holder = _holder(path)
+    holder.send_signal(signal.SIGKILL)
+    holder.wait()
+    # The kernel drops the flock with the process: no stale reclaim needed.
+    with FileLock(path, owner="hermes-pull"):
+        assert held_by(path)["owner"] == "hermes-pull"
+
+
+def test_metadata_age_never_frees_a_live_lock(tmp_path):
+    path = tmp_path / "network.lock"
+    holder = _holder(path)
+    try:
+        meta = path.with_name(path.name + ".meta.json")
+        ancient = time.time() - 86400 * 30
+        os.utime(meta, (ancient, ancient))
+        with pytest.raises(LockBusy):
+            FileLock(path, owner="hermes-pull").acquire()
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_positive_wait_raises_timeout_after_waiting(tmp_path):
+    path = tmp_path / "network.lock"
+    holder = _holder(path)
+    try:
+        started = time.monotonic()
+        with pytest.raises(LockTimeout):
+            FileLock(path, owner="hermes-pull").acquire(wait_seconds=1)
+        assert time.monotonic() - started >= 1
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_a_foreign_instance_cannot_release_the_lock(tmp_path):
+    path = tmp_path / "network.lock"
+    holder = _holder(path)
+    try:
+        FileLock(path, owner="impostor").release()
+        assert held_by(path) is not None
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_lock_file_survives_release(tmp_path):
+    path = tmp_path / "network.lock"
+    with FileLock(path, owner="hermes-pull"):
+        pass
+    assert path.exists()
+    assert held_by(path) is None
 
 
 def test_metadata_records_pid_owner_and_time(tmp_path):
     path = tmp_path / "network.lock"
-    with DirectoryLock(path, owner="hermes-pull"):
-        meta = json.loads((path / "meta.json").read_text())
+    with FileLock(path, owner="hermes-pull"):
+        meta = json.loads(path.with_name(path.name + ".meta.json").read_text())
     assert meta["pid"] == os.getpid()
     assert meta["owner"] == "hermes-pull"
     assert meta["started_at"].endswith("Z")
-
-
-def test_lock_is_released_on_exit(tmp_path):
-    path = tmp_path / "network.lock"
-    with DirectoryLock(path, owner="a"):
-        pass
-    with DirectoryLock(path, owner="b"):
-        pass
-
-
-def test_stale_lock_of_a_dead_process_is_reclaimed(tmp_path):
-    path = tmp_path / "network.lock"
-    path.mkdir()
-    (path / "meta.json").write_text(
-        json.dumps({"pid": 2**22, "owner": "ghost", "started_at": "2026-07-26T00:00:00Z"})
-    )
-    with DirectoryLock(path, owner="hermes-pull"):
-        assert json.loads((path / "meta.json").read_text())["owner"] == "hermes-pull"
-
-
-def test_live_process_lock_is_never_reclaimed_by_age(tmp_path):
-    path = tmp_path / "network.lock"
-    path.mkdir()
-    (path / "meta.json").write_text(
-        json.dumps(
-            {"pid": os.getpid(), "owner": "kf-pull", "started_at": "2000-01-01T00:00:00Z"}
-        )
-    )
-    with pytest.raises(LockBusy, match="kf-pull"):
-        DirectoryLock(path, owner="hermes-pull").acquire()
 ```
 
 - [ ] **Step 2: Прогнать тест и убедиться, что он падает**
@@ -1711,92 +1793,119 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'hermes_backup.locks'`
 
 ```python
 # hermes_backup/locks.py
-"""A lock that says who holds it and is only reclaimed when they are gone.
+"""One narrow uplink, two pullers: whoever holds the lock transfers.
 
-Age alone never justifies stealing a lock: a slow Knowledge Factory pull
-can legitimately run for hours, and stealing from it would put two
-transfers on the same narrow link.
+flock is used rather than a lock directory because the kernel releases it
+when the holder dies. A directory protocol has to decide whether a lock
+is stale, and every such decision races: between mkdir and writing the
+metadata a new lock looks abandoned, and between reading a dead pid and
+removing the directory a third process can take it.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+_POLL_SECONDS = 5
+
 
 class LockBusy(RuntimeError):
-    """Another live process holds the lock."""
+    """Another process holds the lock and no waiting was requested."""
 
 
 class LockTimeout(RuntimeError):
-    """The lock did not become free within the allowed wait."""
+    """The lock stayed held for the whole allowed wait."""
 
 
-def _process_alive(pid: int) -> bool:
+def _meta_path(path: Path) -> Path:
+    return path.with_name(path.name + ".meta.json")
+
+
+def read_meta(path: Path) -> dict | None:
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        return json.loads(_meta_path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
-class DirectoryLock:
+def held_by(path: Path) -> dict | None:
+    """Metadata of the current holder, or None when the lock is free."""
+    if not path.exists():
+        return None
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return read_meta(path) or {}
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
+
+
+class FileLock:
     def __init__(self, path: Path, owner: str) -> None:
         self.path = path
         self.owner = owner
-        self.meta: dict = {}
+        self._fd: int | None = None
 
-    def _read_meta(self) -> dict:
-        try:
-            return json.loads((self.path / "meta.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-
-    def _write_meta(self) -> None:
-        self.meta = {
-            "pid": os.getpid(),
-            "owner": self.owner,
-            "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        (self.path / "meta.json").write_text(json.dumps(self.meta), encoding="utf-8")
-
-    def acquire(self, wait_seconds: int = 0) -> "DirectoryLock":
+    def acquire(self, wait_seconds: int = 0) -> "FileLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The file itself is permanent; only the flock on it comes and goes.
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         deadline = time.monotonic() + wait_seconds
         while True:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                self.path.mkdir()
-            except FileExistsError:
-                holder = self._read_meta()
-                pid = holder.get("pid")
-                if isinstance(pid, int) and _process_alive(pid):
-                    if time.monotonic() >= deadline:
-                        raise LockBusy(
-                            f"held by {holder.get('owner', 'unknown')} (pid {pid})"
-                        ) from None
-                    time.sleep(min(30, max(1, wait_seconds // 60 or 1)))
-                    continue
-                # The holder is gone: reclaim, never by age alone.
-                for leftover in self.path.iterdir():
-                    leftover.unlink()
-                self.path.rmdir()
-                continue
-            self._write_meta()
-            return self
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                holder = read_meta(self.path) or {}
+                if wait_seconds <= 0:
+                    os.close(fd)
+                    raise LockBusy(f"held by {holder.get('owner', 'unknown')}") from None
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    raise LockTimeout(
+                        f"still held by {holder.get('owner', 'unknown')} after {wait_seconds}s"
+                    ) from None
+                time.sleep(min(_POLL_SECONDS, max(0.1, deadline - time.monotonic())))
+        self._fd = fd
+        self._write_meta()
+        return self
+
+    def _write_meta(self) -> None:
+        meta = _meta_path(self.path)
+        tmp = meta.with_name(f".{meta.name}.tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "owner": self.owner,
+                    "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, meta)
 
     def release(self) -> None:
-        meta = self.path / "meta.json"
-        if meta.exists():
-            meta.unlink()
-        if self.path.exists():
-            self.path.rmdir()
+        # Only ever release a descriptor this instance owns: another object
+        # pointing at the same path must not be able to free someone else.
+        if self._fd is None:
+            return
+        _meta_path(self.path).unlink(missing_ok=True)
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        os.close(self._fd)
+        self._fd = None
 
-    def __enter__(self) -> "DirectoryLock":
+    def __enter__(self) -> "FileLock":
         return self.acquire()
 
     def __exit__(self, *exc_info) -> None:
@@ -1806,13 +1915,13 @@ class DirectoryLock:
 - [ ] **Step 4: Прогнать тесты**
 
 Run: `.venv/bin/python -m pytest tests/backup/test_locks.py -v`
-Expected: PASS, 5 тестов.
+Expected: PASS, 7 тестов.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
 git add hermes_backup/locks.py tests/backup/test_locks.py
-git commit -m "feat(backup): add an owner-aware lock with safe stale reclaim"
+git commit -m "feat(backup): guard the shared uplink with an flock file lock"
 ```
 
 ---
@@ -2734,7 +2843,7 @@ git commit -m "fix(backup): stop tarring live SQLite files in the full archive"
 - Test: `tests/backup/test_filevault.py`, `tests/backup/test_offsite_pull.py`
 
 **Interfaces:**
-- Consumes: `locks.DirectoryLock`, `state.parse_state`, `status.*`, `config.*`.
+- Consumes: `locks.FileLock`, `state.parse_state`, `status.*`, `config.*`.
 - Produces: `FileVaultOff(RuntimeError)`; `require_filevault(command: list[str] | None = None) -> None`; `pull(root: Path, remote: str, key: Path, *, runner=subprocess.run) -> Path`; `check_freshness(root: Path, max_age_hours: int) -> Path`; `main(argv=None) -> int`.
 
 - [ ] **Step 1: Написать падающий тест**
@@ -2874,7 +2983,7 @@ from pathlib import Path
 from hermes_backup import config
 from hermes_backup.filevault import FileVaultOff, require_filevault
 from hermes_backup.hashing import sha256_file
-from hermes_backup.locks import DirectoryLock, LockBusy
+from hermes_backup.locks import FileLock, LockBusy, LockTimeout
 from hermes_backup.state import parse_state
 from hermes_backup.status import status_line, write_status
 
@@ -2994,10 +3103,10 @@ def main(argv: list[str] | None = None) -> int:
         write_status(args.status_dir, "offsite_pull", "FAILED", reason=str(error))
         print(status_line("offsite_pull", "FAILED", str(error)), file=sys.stderr)
         return 1
-    lock = DirectoryLock(config.MAC_NETWORK_LOCK, owner="hermes-pull")
+    lock = FileLock(config.MAC_NETWORK_LOCK, owner="hermes-pull")
     try:
         lock.acquire(wait_seconds=config.NETWORK_LOCK_WAIT_SECONDS)
-    except LockBusy as error:
+    except (LockBusy, LockTimeout) as error:
         write_status(args.status_dir, "offsite_pull", "FAILED", reason="lock_timeout")
         print(status_line("offsite_pull", "FAILED", f"lock_timeout {error}"), file=sys.stderr)
         return 1
@@ -3550,11 +3659,13 @@ def test_missing_components_are_named_not_hidden(tmp_path):
 
 
 def test_held_lock_is_reported_with_owner(tmp_path):
+    from hermes_backup.locks import FileLock
+
     lock = tmp_path / "network.lock"
-    lock.mkdir()
-    (lock / "meta.json").write_text('{"pid": 1, "owner": "kf-pull", "started_at": "2026-07-26T09:00:00Z"}')
-    text = summary(tmp_path / "offsite", tmp_path / "status", lock)
+    with FileLock(lock, owner="kf-pull"):
+        text = summary(tmp_path / "offsite", tmp_path / "status", lock)
     assert "kf-pull" in text
+    assert "held by" in text
 ```
 
 - [ ] **Step 2: Прогнать тест и убедиться, что он падает**
@@ -3576,6 +3687,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from hermes_backup import config
+from hermes_backup.locks import held_by
 from hermes_backup.status import read_status
 
 COMPONENTS = ("offsite_pull", "freshness", "restore_drill")
@@ -3599,14 +3711,16 @@ def summary(root: Path, status_dir: Path, lock: Path) -> str:
         reason = f" — {record['reason']}" if record.get("reason") else ""
         lines.append(f"{name}: {record['outcome']} at {record['finished_at']}{reason}")
 
-    if lock.exists():
-        try:
-            meta = json.loads((lock / "meta.json").read_text(encoding="utf-8"))
-            lines.append(f"network lock: held by {meta.get('owner')} since {meta.get('started_at')}")
-        except (OSError, json.JSONDecodeError):
-            lines.append("network lock: held (metadata unreadable)")
-    else:
+    # Existence proves nothing: the lock file is permanent. Ask flock.
+    holder = held_by(lock)
+    if holder is None:
         lines.append("network lock: free")
+    elif holder:
+        lines.append(
+            f"network lock: held by {holder.get('owner')} since {holder.get('started_at')}"
+        )
+    else:
+        lines.append("network lock: held (metadata unreadable)")
     return "\n".join(lines)
 
 
@@ -3799,11 +3913,12 @@ git commit -m "fix(restore): parse STATE instead of sourcing it as root"
 ### Task 17: Knowledge Factory — FileVault-гейт и общий сетевой лок
 
 **Files:**
+- Create: `scripts/offsite_lock.py`
 - Modify: `scripts/pull_backups_from_aeza.sh`
 - Test: `tests/test_pull_filevault_gate.py`
 
 **Interfaces:**
-- Consumes: `hermes_backup.locks` не используется — KF берёт тот же каталог-лок собственными средствами, протокол общий: каталог `~/Library/Application Support/offsite-sync/network.lock` с `meta.json`, содержащим `pid`, `owner`, `started_at`.
+- Consumes: тот же файл `~/Library/Application Support/offsite-sync/network.lock`, что и Hermes. Протокол общий и не зависит от реализации: `fcntl.flock(LOCK_EX)` на постоянном файле, `meta.json` рядом — информационный sidecar. KF держит лок из Python-обёртки, запускающей скрипт дочерним процессом; Hermes — через `hermes_backup.locks.FileLock`.
 - Produces: скрипт, который не делает ни одного сетевого вызова без активного FileVault и не конкурирует с Hermes pull за канал.
 
 - [ ] **Step 1: Написать падающий тест**
@@ -3859,7 +3974,7 @@ def test_gate_blocks_the_run_when_filevault_is_off(tmp_path):
 Run: `cd /Users/romanmizanov/Documents/BD/knowledge-factory && uv run pytest tests/test_pull_filevault_gate.py -v`
 Expected: FAIL — в скрипте нет ни гейта, ни лока.
 
-- [ ] **Step 3: Добавить гейт и лок в начало скрипта**
+- [ ] **Step 3: Добавить гейт и переиспользовать общий flock**
 
 Вставить сразу после `set -euo pipefail`:
 
@@ -3871,31 +3986,131 @@ if ! fdesetup isactive >/dev/null 2>&1; then
   exit 1
 fi
 
-# One narrow uplink, two pullers: whoever gets the lock transfers, the
-# other waits. A stale lock is only reclaimed when its process is gone —
-# never by age, because a legitimate KF pull can run for hours.
-LOCK_DIR="$HOME/Library/Application Support/offsite-sync/network.lock"
-WAIT_SECONDS="${OFFSITE_LOCK_WAIT_SECONDS:-21600}"
-mkdir -p "$(dirname "$LOCK_DIR")"
-deadline=$(( $(date +%s) + WAIT_SECONDS ))
-while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-  holder_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' \
-    "$LOCK_DIR/meta.json" 2>/dev/null || true)"
-  if [ -n "$holder_pid" ] && kill -0 "$holder_pid" 2>/dev/null; then
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "offsite_pull_FAILED lock_timeout held by pid $holder_pid" >&2
-      exit 1
-    fi
-    sleep 30
-    continue
-  fi
-  rm -f "$LOCK_DIR/meta.json" 2>/dev/null || true
-  rmdir "$LOCK_DIR" 2>/dev/null || true
-done
-printf '{"pid": %d, "owner": "kf-pull", "started_at": "%s"}\n' \
-  "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$LOCK_DIR/meta.json"
-release_lock() { rm -f "$LOCK_DIR/meta.json"; rmdir "$LOCK_DIR" 2>/dev/null || true; }
-trap release_lock EXIT
+# One narrow uplink, two pullers. The lock is the same fcntl.flock file
+# Hermes uses, held by a wrapper that runs this script as its child, so
+# the kernel frees it if we die. macOS has no flock(1), hence Python.
+if [ -z "${KF_PULL_LOCKED:-}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  exec env KF_PULL_LOCKED=1 python3 "$SCRIPT_DIR/offsite_lock.py" \
+    --owner kf-pull \
+    --wait "${OFFSITE_LOCK_WAIT_SECONDS:-21600}" \
+    -- "${BASH_SOURCE[0]}" "$@"
+fi
+```
+
+Создать `scripts/offsite_lock.py`:
+
+```python
+#!/usr/bin/env python3
+"""Run a command while holding the shared off-site uplink lock.
+
+The same lock file guards the Hermes pull, which takes it through
+fcntl.flock directly. flock is used rather than a lock directory because
+the kernel releases it when the holder dies, so a killed pull never
+leaves the uplink blocked. macOS ships no flock(1).
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_LOCK = Path(
+    os.environ.get(
+        "OFFSITE_NETWORK_LOCK",
+        str(Path.home() / "Library/Application Support/offsite-sync/network.lock"),
+    )
+)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--owner", required=True)
+    parser.add_argument("--wait", type=int, default=21600)
+    parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    command = args.command[1:] if args.command and args.command[0] == "--" else args.command
+    if not command:
+        print("offsite_lock_FAILED no command", file=sys.stderr)
+        return 2
+
+    args.lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(args.lock, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + args.wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                print("offsite_pull_FAILED lock_timeout", file=sys.stderr)
+                return 1
+            time.sleep(5)
+
+    meta = args.lock.with_name(args.lock.name + ".meta.json")
+    tmp = meta.with_name(f".{meta.name}.tmp")
+    tmp.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "owner": args.owner,
+                "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, meta)
+    try:
+        return subprocess.run(command, check=False).returncode
+    finally:
+        meta.unlink(missing_ok=True)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Тест в `tests/test_pull_filevault_gate.py` дополнить:
+
+```python
+def test_script_reexecs_itself_under_the_shared_flock():
+    text = SCRIPT.read_text()
+    assert "offsite_lock.py" in text
+    assert "KF_PULL_LOCKED" in text
+    # No home-grown mkdir protocol: the lock must be the shared flock file.
+    assert "mkdir \"$LOCK_DIR\"" not in text
+
+
+def test_wrapper_releases_the_lock_when_the_child_dies(tmp_path):
+    import subprocess
+    import sys
+
+    lock = tmp_path / "network.lock"
+    wrapper = REPO / "scripts" / "offsite_lock.py"
+    first = subprocess.run(
+        [sys.executable, str(wrapper), "--owner", "test", "--lock", str(lock), "--", "true"],
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0
+    # A finished holder must leave the uplink free for the next run.
+    second = subprocess.run(
+        [sys.executable, str(wrapper), "--owner", "test", "--wait", "1", "--lock", str(lock), "--", "true"],
+        capture_output=True,
+        text=True,
+    )
+    assert second.returncode == 0
 ```
 
 - [ ] **Step 4: Прогнать тесты**
@@ -3972,6 +4187,29 @@ EOF
 
 Старая cron-запись в 03:15 снимается: расписание теперь ведут таймеры,
 и только они знают про `SuccessExitStatus=75`.
+
+- [ ] **Step 4a: Одноразовая миграция старого каталога-лока**
+
+Ранние черновики использовали каталог `network.lock`; протокол заменён на
+`fcntl.flock` по обычному файлу. Каталог не содержит данных — только следы
+владельца, — но пока он существует, `os.open` на этом пути падает с `EISDIR`.
+
+```bash
+launchctl list | grep -E "com.hermes.offsite-pull|knowledge-factory.backup-pull" || echo "оба агента выгружены"
+pgrep -fl "pull_backups_from_aeza|hermes_backup.offsite_pull" || echo "процессов стягивания нет"
+
+LOCK="$HOME/Library/Application Support/offsite-sync/network.lock"
+if [ -d "$LOCK" ]; then
+  rm -f "$LOCK/meta.json"
+  rmdir "$LOCK"
+fi
+: >"$LOCK"
+chmod 600 "$LOCK"
+ls -l "$LOCK"
+```
+
+Выполнять только при выгруженных агентах и отсутствии процессов стягивания —
+иначе миграция снимет лок из-под работающего pull'а.
 
 - [ ] **Step 5: Первый pull и drill на Mac**
 
@@ -4055,5 +4293,7 @@ FileVault → Task 1.
 так. `drill()` возвращает словарь с ключами `sessions`, `skills`, `plugins`,
 `cron_jobs`, `unclassified` — формат вывода в `main()` использует те же
 ключи. `status_line(name, outcome, reason)` вызывается везде без префикса
-`hermes_`, который добавляет сама функция. `DirectoryLock(path, owner)` —
-одинаковая сигнатура в Task 9, 13.
+`hermes_`, который добавляет сама функция. `FileLock(path, owner)` —
+одинаковая сигнатура в Task 9 и 13; `held_by(path)` из того же модуля читает
+Task 15. Knowledge Factory в Task 17 держит тот же файл через `scripts/offsite_lock.py`,
+поэтому протокол общий, а реализации независимы.
