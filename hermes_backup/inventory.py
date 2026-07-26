@@ -36,6 +36,19 @@ EXCLUDE_RULES: tuple[str, ...] = (
     "kanban.db",
     "kanban.db-*",
     "**/__pycache__/*",
+    # Runtime debris observed on the live tree 2026-07-27: regenerated on
+    # start, meaningless in a restore.
+    "audio_cache/*",
+    ".install_method",
+    ".restart_last_processed.json",
+    "gateway.pid",
+    "auth.lock",
+    "gateway.lock",
+    "kanban.db.init.lock",
+    "cron/.jobs.lock",
+    "cron/.tick.lock",
+    # Advisory locks written by tools/memory_tool.py, not memory itself.
+    "memories/*.lock",
 )
 ESSENTIAL_RULES: tuple[str, ...] = (
     "state.db",
@@ -53,6 +66,18 @@ ESSENTIAL_RULES: tuple[str, ...] = (
     ".local/*",
     "cron/jobs.json",
     "cron/state/*",
+    # Named after the first live backup reported 29 unclassified files:
+    # every one of these is state a restore needs.
+    "SOUL.md",
+    "memories/*",
+    "scripts/*",
+    "channel_directory.json",
+    "gateway_state.json",
+    "spend.json",
+    "AppData/Local/hermes/state/*",
+    "plugin-backups/*",
+    "deploy-backups/*",
+    "mcp-tokens/*",
 )
 
 

@@ -316,3 +316,144 @@ def test_an_unparsable_created_at_is_a_drill_error(tmp_path):
     _set_state(published, "CREATED_AT", "not-a-date")
     with pytest.raises(DrillError, match="created_at_invalid"):
         drill(published)
+
+
+def _token_store(tree: Path, mode: int = 0o700, file_mode: int = 0o600) -> Path:
+    store = tree / "mcp-tokens"
+    store.mkdir(parents=True, exist_ok=True)
+    token = store / "vercel.json"
+    token.write_text('{"access_token": "x"}')
+    token.chmod(file_mode)
+    store.chmod(mode)
+    return store
+
+
+def test_a_healthy_token_store_passes(tmp_path):
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _token_store(tree)
+    _check_token_store(tree)
+
+
+def test_a_missing_token_store_is_allowed(tmp_path):
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _check_token_store(tree)
+
+
+def test_a_world_readable_token_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _token_store(tree, file_mode=0o644)
+    with pytest.raises(DrillError, match="permissions_too_wide"):
+        _check_token_store(tree)
+
+
+def test_a_group_readable_token_directory_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _token_store(tree, mode=0o755)
+    with pytest.raises(DrillError, match="token_store_mode"):
+        _check_token_store(tree)
+
+
+def test_a_nested_token_is_checked_too(tmp_path):
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    store = _token_store(tree)
+    nested = store / "provider" / "refresh.json"
+    nested.parent.mkdir()
+    nested.write_text("{}")
+    nested.chmod(0o640)
+    # The directory itself is fine, so the file's mode is what must fail.
+    nested.parent.chmod(0o700)
+    with pytest.raises(DrillError, match="permissions_too_wide"):
+        _check_token_store(tree)
+
+
+def test_a_symlink_inside_the_token_store_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    store = _token_store(tree)
+    (store / "alias.json").symlink_to("vercel.json")
+    with pytest.raises(DrillError, match="token_store_symlink"):
+        _check_token_store(tree)
+
+
+def test_an_unparsable_token_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    store = _token_store(tree)
+    broken = store / "broken.json"
+    broken.write_text("{not json")
+    broken.chmod(0o600)
+    with pytest.raises(DrillError, match="token_unparsable"):
+        _check_token_store(tree)
+
+
+def test_a_token_store_that_is_a_symlink_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    (tree / "mcp-tokens").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    with pytest.raises(DrillError, match="token_store_not_a_directory"):
+        _check_token_store(tree)
+
+
+def test_a_dangling_token_store_symlink_is_rejected(tmp_path):
+    """exists() says False for a dangling link — it must not read as absent."""
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "mcp-tokens").symlink_to(tmp_path / "nowhere")
+    with pytest.raises(DrillError, match="token_store_not_a_directory"):
+        _check_token_store(tree)
+
+
+def test_a_group_readable_nested_directory_is_rejected(tmp_path):
+    """A readable directory leaks the file names, which name the providers."""
+    from hermes_backup.restore_drill import _check_token_store
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    store = _token_store(tree)
+    nested = store / "provider"
+    nested.mkdir()
+    (nested / "refresh.json").write_text("{}")
+    (nested / "refresh.json").chmod(0o600)
+    nested.chmod(0o755)
+    with pytest.raises(DrillError, match="token_store_mode"):
+        _check_token_store(tree)
+
+
+def test_a_loose_token_fails_the_whole_drill(tmp_path):
+    """End to end: a real backup with a 0644 token must fail the real drill."""
+    data = _fixture_tree(tmp_path)
+    store = data / "mcp-tokens"
+    store.mkdir()
+    token = store / "vercel.json"
+    token.write_text('{"access_token": "x"}')
+    token.chmod(0o644)
+    store.chmod(0o700)
+
+    published = run(data, tmp_path / "essential", snapshot_runner=_direct_runner)
+
+    with pytest.raises(DrillError, match="permissions_too_wide mcp-tokens/vercel.json"):
+        drill(published)

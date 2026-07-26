@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import stat
 import sys
@@ -43,6 +44,7 @@ from hermes_backup.status import status_line, write_status
 SUPPORTED_FORMAT = 1
 REQUIRED = ("auth.json", "config.yaml", "state.db", "kanban.db", "cron/jobs.json")
 SECRETS = ("auth.json", "config.yaml", "sessions/sessions.json")
+TOKEN_STORE = "mcp-tokens"
 DATABASES = {
     "state.db": ("STATE_DB_SHA256", "STATE_DB_PAGE_COUNT", "STATE_DB_USER_VERSION"),
     "kanban.db": ("KANBAN_DB_SHA256", "KANBAN_DB_PAGE_COUNT", "KANBAN_DB_USER_VERSION"),
@@ -171,6 +173,57 @@ def _secret_paths(tree: Path):
     yield from sorted(tree.glob(".env*"))
 
 
+def _check_token_store(tree: Path) -> None:
+    """OAuth tokens live here, so nothing about this directory is optional.
+
+    The store itself may be absent — not every deployment has one — but if
+    anything is there it must be a plain directory of plain files, all
+    unreadable to anyone else, and every JSON in it must still parse.
+    """
+    store = tree / TOKEN_STORE
+    # is_symlink before exists: a dangling symlink answers False to exists()
+    # and would slip through as "no store at all".
+    if store.is_symlink():
+        raise DrillError(f"token_store_not_a_directory {TOKEN_STORE}")
+    if not store.exists():
+        return
+    if not store.is_dir():
+        raise DrillError(f"token_store_not_a_directory {TOKEN_STORE}")
+    mode = stat.S_IMODE(store.stat().st_mode)
+    if mode != 0o700:
+        raise DrillError(f"token_store_mode {TOKEN_STORE} {mode:o}")
+
+    # os.walk without following links: rglob would descend into a symlinked
+    # directory before we ever got to reject it.
+    for dirpath, dirnames, filenames in os.walk(store, followlinks=False):
+        base = Path(dirpath)
+        for name in sorted(dirnames):
+            path = base / name
+            rel = path.relative_to(tree)
+            if path.is_symlink():
+                raise DrillError(f"token_store_symlink {rel}")
+            directory_mode = stat.S_IMODE(path.stat().st_mode)
+            # A readable directory leaks the file names, which name the
+            # providers a token exists for.
+            if directory_mode != 0o700:
+                raise DrillError(f"token_store_mode {rel} {directory_mode:o}")
+        for name in sorted(filenames):
+            path = base / name
+            rel = path.relative_to(tree)
+            if path.is_symlink():
+                raise DrillError(f"token_store_symlink {rel}")
+            if not path.is_file():
+                raise DrillError(f"token_store_special {rel}")
+            file_mode = stat.S_IMODE(path.stat().st_mode)
+            if file_mode & ~0o600:
+                raise DrillError(f"permissions_too_wide {rel} {file_mode:o}")
+            if path.suffix == ".json":
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise DrillError(f"token_unparsable {rel}: {error}") from error
+
+
 def _require_private_modes(tree: Path) -> None:
     for path in _secret_paths(tree):
         mode = stat.S_IMODE(path.stat().st_mode)
@@ -215,6 +268,7 @@ def drill(
         counts = _check_counts(tree, state)
         _check_inventory(backup, tree, workdir, state)
         _require_private_modes(tree)
+        _check_token_store(tree)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise

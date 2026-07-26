@@ -1,4 +1,6 @@
 import json
+
+import pytest
 import os
 
 from hermes_backup.inventory import (
@@ -253,3 +255,78 @@ def test_a_target_named_like_a_parent_reference_stays_inside(tmp_path):
 
     assert escapes_tree(source / "link", source) is False
     assert write_exclusions(source, out).escaping == 0
+
+
+OBSERVED_ESSENTIAL = (
+    "SOUL.md",
+    "memories/MEMORY.md",
+    "memories/USER.md",
+    "scripts/npz_russia_monitor.py",
+    "scripts/azs_krd_limits_monitor.py",
+    "scripts/npz_yufo_monitor.py",
+    "scripts/tts_monitor.py",
+    "channel_directory.json",
+    "gateway_state.json",
+    "spend.json",
+    "AppData/Local/hermes/state/tts_monitor.json",
+    "plugin-backups/restrict-guest-tools-20260725T153300Z/plugin.yaml",
+    "plugin-backups/restrict-guest-tools-20260725T153300Z/__init__.py",
+    "plugin-backups/restrict-guest-tools-20260725T153300Z/DESIGN.md",
+    "deploy-backups/compose.yaml.pre-kf-cutover-20260725T161125Z",
+    "mcp-tokens/vercel.json",
+    "mcp-tokens/vercel.client.json",
+    "mcp-tokens/vercel.meta.json",
+)
+OBSERVED_EXCLUDED = (
+    "audio_cache/audio_d3053daaf172.ogg",
+    ".install_method",
+    ".restart_last_processed.json",
+    "gateway.pid",
+    "auth.lock",
+    "gateway.lock",
+    "kanban.db.init.lock",
+    "cron/.jobs.lock",
+    "cron/.tick.lock",
+    "memories/MEMORY.md.lock",
+    "memories/USER.md.lock",
+)
+
+
+@pytest.mark.parametrize("path", OBSERVED_ESSENTIAL)
+def test_observed_state_is_classified_essential(path):
+    assert excluded_by(path) is None
+    assert classify(path) == "essential"
+
+
+@pytest.mark.parametrize("path", OBSERVED_EXCLUDED)
+def test_observed_runtime_debris_is_excluded(path):
+    assert excluded_by(path) is not None
+
+
+def test_every_observed_path_is_named_by_a_rule():
+    """The first live backup reported 29 unclassified files. All 29 are
+    named now: each is either excluded outright or classified essential,
+    and none may fall through."""
+    observed = OBSERVED_ESSENTIAL + OBSERVED_EXCLUDED
+    assert len(set(observed)) == 29
+    for path in OBSERVED_ESSENTIAL:
+        assert excluded_by(path) is None, path
+        assert classify(path) == "essential", path
+    for path in OBSERVED_EXCLUDED:
+        assert excluded_by(path) is not None, path
+
+
+def test_the_whole_observed_tree_leaves_nothing_unclassified(tmp_path):
+    """Only the essential half reaches staging — the rest is excluded
+    before it gets there — so the counter has to read zero."""
+    staging = tmp_path / "staging"
+    for rel in OBSERVED_ESSENTIAL:
+        target = staging / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x")
+    out = tmp_path / "INVENTORY.jsonl"
+
+    totals = write_inventory(staging, out)
+
+    assert totals.files == len(OBSERVED_ESSENTIAL)
+    assert totals.unclassified == 0
