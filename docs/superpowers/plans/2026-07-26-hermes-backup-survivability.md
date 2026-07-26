@@ -328,7 +328,9 @@ def test_atomic_write_leaves_no_partial_file(tmp_path):
     target = tmp_path / "STATE"
     atomic_write_text(target, "SOURCE_HOST=aeza\n")
     assert target.read_text() == "SOURCE_HOST=aeza\n"
-    assert list(tmp_path.iterdir()) == [target]
+    # Only files: the repo-wide autouse fixture in tests/conftest.py puts a
+    # hermes_test/ directory into every tmp_path.
+    assert [item.name for item in tmp_path.iterdir() if item.is_file()] == ["STATE"]
     assert target.stat().st_mode & 0o777 == 0o600
 
 
@@ -1558,7 +1560,8 @@ def test_status_is_written_atomically_and_read_back(tmp_path):
     assert record["outcome"] == "OK"
     assert record["backup_path"] == "/srv/x/daily-1"
     assert record["finished_at"].endswith("Z")
-    assert [p.name for p in tmp_path.iterdir()] == ["essential_backup.json"]
+    # Only files: tests/conftest.py seeds every tmp_path with hermes_test/.
+    assert [p.name for p in tmp_path.iterdir() if p.is_file()] == ["essential_backup.json"]
 
 
 def test_failure_keeps_the_reason(tmp_path):
