@@ -209,3 +209,34 @@ def test_inventory_does_not_hash_a_special(tmp_path):
     assert row["type"] == "special"
     assert "sha256" not in row
     assert totals.files == 1
+
+
+def test_a_symlink_pointing_outside_the_tree_is_recorded_as_escaping(tmp_path):
+    """PulseAudio leaves /tmp links in the data tree; they cannot travel."""
+    source = tmp_path / "data"
+    (source / ".config" / "pulse").mkdir(parents=True)
+    (source / ".config" / "pulse" / "host-runtime").symlink_to("/tmp/pulse-abc")
+    (source / "inside.md").write_text("x")
+    (source / "alias.md").symlink_to("inside.md")
+    out = tmp_path / "EXCLUSIONS.jsonl"
+
+    totals = write_exclusions(source, out)
+
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    escaping = [
+        row for row in rows if row["classification"] == "excluded-escaping-link"
+    ]
+    assert totals.escaping == 1
+    assert escaping[0]["path"] == ".config/pulse/host-runtime"
+    assert escaping[0]["target"] == "/tmp/pulse-abc"
+    # A link that stays inside is not escaping and belongs in the archive.
+    assert not any(row["path"] == "alias.md" for row in rows)
+
+
+def test_a_relative_link_climbing_out_of_the_tree_escapes(tmp_path):
+    source = tmp_path / "data"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "up.md").symlink_to("../../outside.md")
+    out = tmp_path / "EXCLUSIONS.jsonl"
+
+    assert write_exclusions(source, out).escaping == 1

@@ -67,6 +67,7 @@ class InventoryTotals:
 class ExclusionTotals:
     files: int
     specials: int
+    escaping: int
 
 
 def _kind(path: Path) -> str:
@@ -77,6 +78,19 @@ def _kind(path: Path) -> str:
     if stat.S_ISREG(mode):
         return "file"
     return "special"
+
+
+def escapes_tree(link: Path, root: Path) -> bool:
+    """True when a symlink points outside the tree.
+
+    Judged lexically, never by resolving: the target may not exist, and
+    resolving would follow it out of the tree to answer the question.
+    """
+    target = os.readlink(link)
+    if os.path.isabs(target):
+        return True
+    resolved = os.path.normpath(os.path.join(link.parent, target))
+    return os.path.relpath(resolved, root).startswith("..")
 
 
 def _matches(rel: str, rules: tuple[str, ...]) -> str | None:
@@ -162,12 +176,24 @@ def write_exclusions(source: Path, out: Path) -> ExclusionTotals:
     them behind by design, and an unrecorded loss is exactly what this
     backup must not produce.
     """
-    files = specials = 0
+    files = specials = escaping = 0
     with out.open("w", encoding="utf-8") as handle:
         for path, rel in _entries(source):
             kind = _kind(path)
             rule = excluded_by(rel)
-            if kind == "special":
+            if kind == "symlink" and escapes_tree(path, source):
+                # rsync --safe-links leaves these behind, and the archive
+                # validator would reject one anyway. Record it so a link
+                # that mattered is visible rather than silently gone.
+                record = {
+                    "path": rel,
+                    "rule": rule or "escaping-symlink",
+                    "type": "symlink",
+                    "target": os.readlink(path),
+                    "classification": "excluded-escaping-link",
+                }
+                escaping += 1
+            elif kind == "special":
                 record = {
                     "path": rel,
                     "rule": rule or "special-object",
@@ -199,4 +225,4 @@ def write_exclusions(source: Path, out: Path) -> ExclusionTotals:
                 files += 1
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     out.chmod(0o600)
-    return ExclusionTotals(files=files, specials=specials)
+    return ExclusionTotals(files=files, specials=specials, escaping=escaping)

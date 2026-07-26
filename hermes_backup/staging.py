@@ -26,6 +26,10 @@ _ITEMIZED = re.compile(r"\A(\*deleting|[<>ch.][fdLDS])")
 RSYNC_FLAGS = (
     "-rlptgoH",
     "--numeric-ids",
+    # Links pointing outside the tree cannot be archived safely and would
+    # be rejected by the archive validator; leave them behind here and let
+    # write_exclusions record them.
+    "--safe-links",
     "--delete",
     "--delete-excluded",
     "--itemize-changes",

@@ -44,6 +44,7 @@ def _state_text(created_at: str) -> str:
         "ESSENTIAL_TOTAL_BYTES": 1000,
         "UNCLASSIFIED_FILE_COUNT": 0,
         "EXCLUDED_SPECIAL_COUNT": 0,
+        "EXCLUDED_ESCAPING_LINK_COUNT": 0,
     }
     return "".join(f"{key}={values[key]}\n" for key in sorted(values))
 

@@ -277,6 +277,7 @@ def run(
                 "ESSENTIAL_TOTAL_BYTES": totals.total_bytes,
                 "UNCLASSIFIED_FILE_COUNT": totals.unclassified,
                 "EXCLUDED_SPECIAL_COUNT": exclusions.specials,
+                "EXCLUDED_ESCAPING_LINK_COUNT": exclusions.escaping,
             }),
         )
 
@@ -300,17 +301,19 @@ def run(
 def _self_check(directory: Path) -> None:
     validate(directory / "essential.tar.gz")
     state = parse_state((directory / "STATE").read_text(encoding="utf-8"))
-    exclusions = (directory / "EXCLUSIONS.jsonl").read_text(encoding="utf-8")
-    recorded = sum(
-        1
-        for line in exclusions.splitlines()
-        if json.loads(line)["classification"] == "excluded-special"
-    )
-    if recorded != state["EXCLUDED_SPECIAL_COUNT"]:
-        raise RuntimeError(
-            f"special_count_mismatch: STATE={state['EXCLUDED_SPECIAL_COUNT']} "
-            f"file={recorded}"
-        )
+    rows = [
+        json.loads(line)
+        for line in (directory / "EXCLUSIONS.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    for classification, key in (
+        ("excluded-special", "EXCLUDED_SPECIAL_COUNT"),
+        ("excluded-escaping-link", "EXCLUDED_ESCAPING_LINK_COUNT"),
+    ):
+        recorded = sum(1 for row in rows if row["classification"] == classification)
+        if recorded != state[key]:
+            raise RuntimeError(f"{key}_mismatch: STATE={state[key]} file={recorded}")
     for line in (directory / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
         digest, name = line.split("  ", 1)
         if sha256_file(directory / name) != digest:
@@ -346,7 +349,8 @@ def main(argv: list[str] | None = None) -> int:
             "OK",
             f"path={published} files={state['ESSENTIAL_FILE_COUNT']} "
             f"unclassified={state['UNCLASSIFIED_FILE_COUNT']} "
-            f"specials={state['EXCLUDED_SPECIAL_COUNT']}",
+            f"specials={state['EXCLUDED_SPECIAL_COUNT']} "
+            f"escaping_links={state['EXCLUDED_ESCAPING_LINK_COUNT']}",
         )
     )
     return 0
