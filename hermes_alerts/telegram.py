@@ -28,12 +28,18 @@ def render_message(event: dict) -> str:
 
 
 def send_message(
-    token: str, chat_id: str, text: str, *, timeout_seconds: int = 15
+    token: str,
+    chat_id: str,
+    text: str,
+    *,
+    timeout_seconds: int = 15,
+    silent: bool = False,
 ) -> str:
     body = urllib.parse.urlencode({
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": "true",
+        "disable_notification": "true" if silent else "false",
     })
     connection = http.client.HTTPSConnection(
         "api.telegram.org", timeout=timeout_seconds

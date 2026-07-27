@@ -41,7 +41,11 @@ def test_delivery_removes_event_only_after_all_recipients(tmp_path, monkeypatch)
     path = enqueue(settings, "task", "TEST", "hello", dedupe_key="deliver")
     sent = []
     monkeypatch.setattr(
-        cli, "send_message", lambda token, chat, text: sent.append((token, chat)) or "1"
+        cli,
+        "send_message",
+        lambda token, chat, text, **kwargs: (
+            sent.append((token, chat, kwargs["silent"])) or "1"
+        ),
     )
     code = cli.main([
         "--config",
@@ -53,7 +57,7 @@ def test_delivery_removes_event_only_after_all_recipients(tmp_path, monkeypatch)
         str(env),
     ])
     assert code == 0
-    assert sent == [("123:abc", "350391119")]
+    assert sent == [("123:abc", "350391119", True)]
     assert not path.exists()
 
 
@@ -61,7 +65,7 @@ def test_failed_delivery_stays_in_outbox_with_attempt_count(tmp_path, monkeypatc
     config, env, settings = _fixture(tmp_path)
     path = enqueue(settings, "task", "FAILED", "boom", dedupe_key="retry")
 
-    def fail(*_args):
+    def fail(*_args, **_kwargs):
         raise DeliveryError("offline")
 
     monkeypatch.setattr(cli, "send_message", fail)

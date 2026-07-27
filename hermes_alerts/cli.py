@@ -49,7 +49,12 @@ def _deliver(args) -> int:
             pending = [str(item) for item in event["pending_chat_ids"]]
             for chat_id in pending:
                 try:
-                    send_message(token, chat_id, render_message(event))
+                    send_message(
+                        token,
+                        chat_id,
+                        render_message(event),
+                        silent=event["kind"] == "TEST",
+                    )
                 except DeliveryError as error:
                     event["attempts"] = int(event.get("attempts", 0)) + 1
                     event["last_error"] = str(error)
