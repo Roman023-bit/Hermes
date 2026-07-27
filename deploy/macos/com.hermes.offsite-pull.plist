@@ -10,7 +10,8 @@
     <string>/usr/bin/caffeinate</string>
     <string>-i</string>
     <string>/bin/bash</string>
-    <string>/Users/romanmizanov/Documents/Hermes/deploy/macos/hermes_pull_offsite.sh</string>
+    <string>/Users/romanmizanov/.local/share/hermes/operations-runtime/run.sh</string>
+    <string>hermes_backup.offsite_pull</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>

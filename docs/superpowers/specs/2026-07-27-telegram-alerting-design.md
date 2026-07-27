@@ -102,3 +102,23 @@ The Mac runs independent delivery and monitor LaunchAgents plus a weekly
 heartbeat. Existing Hermes and Knowledge Factory LaunchAgents keep their
 schedules; the KF jobs gain status wrappers.
 
+All five Hermes operations LaunchAgents execute an installed, private runtime
+under `~/.local/share/hermes/operations-runtime`. They do not execute code
+from the checkout in `~/Documents`: macOS can load such a plist successfully
+and then deny the first real script open with exit 126. The installer builds
+and validates the replacement before unloading any working agent, then
+restores all five labels.
+
+## Live acceptance
+
+The deployed Aeza monitor reports all six components healthy; the deployed
+Mac monitor reports all five healthy. Silent `TEST` messages were accepted by
+Telegram from both hosts and removed from their outboxes. A real systemd
+`OnFailure` invocation queued one bounded event without reading a journal.
+Both Hermes Mac backup agents were subsequently executed through launchd,
+not just loaded, and exited successfully from the installed runtime.
+
+Knowledge Factory sync exposed one additional live-tree edge:
+`runtime/logs` and `runtime/legacy-logs` mutate while rsync runs. They are now
+excluded symmetrically from the raw manifest and transfer. The failed run
+published `FAILED`; the repeated full sync published `OK`.

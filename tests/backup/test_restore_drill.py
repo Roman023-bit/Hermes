@@ -273,6 +273,8 @@ def test_drill_runs_on_sunday_morning():
     assert data["StartCalendarInterval"] == {"Weekday": 0, "Hour": 11, "Minute": 0}
     assert "EnvironmentVariables" not in data
     assert "PYTHONPATH" not in PLIST.read_text()
+    assert "/.local/share/hermes/operations-runtime/run.sh" in PLIST.read_text()
+    assert "/Documents/" not in PLIST.read_text()
 
 
 def test_wrapper_locates_the_repository_relative_to_itself():

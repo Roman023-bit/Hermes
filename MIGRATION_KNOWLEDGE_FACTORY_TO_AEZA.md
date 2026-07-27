@@ -1407,3 +1407,44 @@ hermes_restore_drill_OK sessions=2 skills=79 plugins=3 cron_jobs=3 unclassified=
 расписание ведут таймеры, и только они знают про `SuccessExitStatus=75`,
 поэтому штатный пропуск по занятому локу больше не выглядит падением.
 Резервные копии прежнего crontab лежат в `/root/crontab.pre-hermes-timers-*`.
+
+### Telegram-алерты и структурированные статусы
+
+С 2026-07-27 сбои и молчание контуров Hermes и Knowledge Factory
+контролируются независимо от gateway и контейнеров. На Aeza шесть
+компонентов публикуют owner-only JSON-статусы и имеют
+`OnFailure=hermes-alert@%n.service`: два бэкапа Hermes, healthcheck Hermes,
+бэкап KF, healthcheck KF и restore drill KF. На Mac контролируются pull,
+freshness и drill Hermes, а также pull и sync KF.
+
+Событие сначала атомарно попадает в приватный outbox. Доставка в Telegram
+идёт отдельно каждые две минуты и хранит прогресс по каждому получателю:
+после принятия API событие удаляется, до этого повторяется. Переходы
+дедуплицированы: один `FAILED`, напоминание через шесть часов, один
+`RECOVERED`. Еженедельные heartbeat приходят отдельно с Aeza и Mac.
+
+Живые проверки при развёртывании:
+
+- Aeza: все шесть компонентов `OK`, outbox пуст; настоящий
+  `OnFailure` transient-unit поставил ровно одно событие, после чего тестовое
+  событие было удалено без доставки;
+- Mac: все пять компонентов `OK`; тихое событие `TEST` принято Telegram,
+  delivery завершился с кодом 0 и очистил outbox;
+- KF sync сначала честно опубликовал `FAILED`: raw mirror захватывал
+  изменяющиеся `runtime/logs` и `runtime/legacy-logs`. Эти каталоги исключены
+  и из raw manifest, и из rsync; повторный полный sync завершился `OK`.
+
+MacOS не разрешил новым LaunchAgent читать checkout Hermes из `~/Documents`:
+загрузка label'а проходила, а первый реальный RunAtLoad завершался
+`Operation not permitted`, exit 126. Поэтому все пять Hermes operations
+agent'ов теперь работают из приватного установленного runtime
+`~/.local/share/hermes/operations-runtime`. Установка атомарно собирает и
+проверяет замену до выгрузки работающих заданий:
+
+```sh
+deploy/macos/install_hermes_operations.sh
+```
+
+После перехода и `com.hermes.offsite-pull`, и `com.hermes.restore-drill`
+пройдены через настоящий `launchctl kickstart` с итоговым кодом 0; это
+проверяет исполнение, а не только факт загрузки plist.

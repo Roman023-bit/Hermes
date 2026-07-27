@@ -50,8 +50,18 @@ def test_three_alert_launchagents_have_expected_cadence():
     assert "RunAtLoad" not in heartbeat
 
 
-def test_alert_wrapper_uses_repository_venv_without_gateway():
-    text = (MACOS / "hermes_alerts.sh").read_text(encoding="utf-8")
-    assert '.venv/bin/python" -m hermes_alerts' in text
+def test_alert_agents_use_installed_runtime_outside_documents():
+    for path in MACOS.glob("com.hermes.alert-*.plist"):
+        text = path.read_text(encoding="utf-8")
+        assert "/.local/share/hermes/operations-runtime/run.sh" in text
+        assert "/Documents/" not in text
+
+
+def test_operations_runtime_has_no_gateway_dependency():
+    text = (MACOS / "hermes_operations_runtime.sh").read_text(encoding="utf-8")
+    installer = (MACOS / "install_hermes_operations.sh").read_text(encoding="utf-8")
+    assert 'exec "$RUNTIME/venv/bin/python" -m "$@"' in text
+    assert "hermes_alerts" in installer
+    assert "hermes_backup" in installer
     assert "docker exec" not in text
     assert "hermes send" not in text

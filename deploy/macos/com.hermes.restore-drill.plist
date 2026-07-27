@@ -8,7 +8,8 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/romanmizanov/Documents/Hermes/deploy/macos/hermes_restore_drill.sh</string>
+    <string>/Users/romanmizanov/.local/share/hermes/operations-runtime/run.sh</string>
+    <string>hermes_backup.restore_drill</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>

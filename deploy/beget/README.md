@@ -190,6 +190,54 @@ It reads status files rather than parsing logs, and reports the age of the
 newest backup from its `CREATED_AT` — not from the local mtime, which would
 only say when it was downloaded.
 
+### Telegram operational alerts
+
+Alerts are host-side and deliberately do not use the Hermes gateway,
+container or agent loop. A failed gateway must not silence its own alert.
+Both Aeza and the Mac write private JSON events to an atomic outbox; a
+separate delivery job retries Telegram every two minutes until the API
+confirms each configured recipient.
+
+The monitor sends one `FAILED` transition, a reminder every six hours while
+the failure remains, and one `RECOVERED` transition. It also detects silence
+when a timer or LaunchAgent stops running. Aeza and the Mac each send a
+weekly heartbeat, so a broken alert path cannot look like a quiet healthy
+week.
+
+| Host | Monitor | Delivery retry | Heartbeat |
+|---|---|---|---|
+| Aeza | every 5 min (`hermes-alert-monitor.timer`) | every 2 min (`hermes-alert-delivery.timer`) | Sunday 09:00 UTC |
+| Mac | every 5 min (`com.hermes.alert-monitor`) | every 2 min (`com.hermes.alert-delivery`) | Sunday 12:00 local |
+
+`TELEGRAM_ALERT_BOT_TOKEN` in the existing secret `.env` is preferred.
+Until a dedicated alert bot is created, `config.yaml` must explicitly allow
+fallback to `TELEGRAM_BOT_TOKEN`. Recipients are explicit `chat_ids` in
+`config.yaml`; they are not inferred from the gateway allowlist.
+
+Useful checks:
+
+```sh
+# Aeza
+PYTHONPATH=/srv/hermes/app /usr/bin/python3 -m hermes_alerts \
+  --config /srv/hermes/data/config.yaml --profile aeza summary
+systemctl list-timers 'hermes-alert-*'
+
+# Mac
+~/.local/share/hermes/operations-runtime/run.sh hermes_alerts \
+  --config ~/.hermes/config.yaml --profile mac summary
+launchctl list | grep 'com.hermes.alert'
+```
+
+The Mac LaunchAgents execute the installed private runtime under
+`~/.local/share/hermes/operations-runtime`, not the checkout in
+`~/Documents`. This is required by macOS privacy controls: a loaded agent can
+otherwise fail only when it actually runs, with exit 126. Reinstall all five
+Hermes operations agents after updating their code:
+
+```sh
+deploy/macos/install_hermes_operations.sh
+```
+
 ## Dashboard access
 
 The dashboard stays disabled (`HERMES_DASHBOARD=0`) until an auth provider

@@ -263,6 +263,8 @@ def test_launch_agent_carries_no_environment():
     text = PLIST.read_text()
     assert "PYTHONPATH" not in text
     assert "HERMES_REPO" not in text
+    assert "/.local/share/hermes/operations-runtime/run.sh" in text
+    assert "/Documents/" not in text
 
 
 def test_wrapper_locates_the_repository_relative_to_itself():
