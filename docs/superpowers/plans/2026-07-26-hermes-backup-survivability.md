@@ -6604,22 +6604,82 @@ Expected: `old_cron_removed_OK (0 строк осталось)`. Провере�
 
 #### Фаза C. Mac: лок, первый pull, drill, агенты
 
-- [ ] **Step C1: Мигрировать старый каталог-лок**
+Все проверки здесь — условия выхода. Шаг, который печатает предупреждение и
+продолжает, хуже отсутствующего шага: он создаёт видимость проверки.
+
+Сквозное правило фазы: **off-site backup Knowledge Factory не должен остаться
+выключенным из-за сбоя в Hermes-части**. Он работал до этой выкатки, и любая
+наша неудача обязана вернуть его в строй.
+
+- [ ] **Step C1: Остановить агенты и мигрировать лок**
 
 Ранние черновики использовали каталог `network.lock`; протокол заменён на
 `fcntl.flock` по обычному файлу, и `os.open` на каталоге падает с `EISDIR`.
 
+Порядок внутри шага важен: сначала гейты, потом выгрузка. Обратный порядок
+оставил бы KF выключенным при отказе на проверке, которую можно было сделать
+раньше.
+
 ```bash
 set -euo pipefail
-launchctl bootout "gui/$(id -u)/com.knowledge-factory.backup-pull" 2>/dev/null || true
-launchctl bootout "gui/$(id -u)/com.hermes.offsite-pull" 2>/dev/null || true
-launchctl list | grep -E "knowledge-factory.backup-pull|com.hermes.offsite-pull" \
-  && echo "ВНИМАНИЕ: агент ещё загружен" || echo "оба агента выгружены"
-pgrep -f "pull_backups_from_aeza|hermes_backup.offsite_pull" \
-  && echo "ВНИМАНИЕ: стягивание идёт" || echo "процессов стягивания нет"
+GUI="gui/$(id -u)"
+KF=com.knowledge-factory.backup-pull
+AGENTS=("$KF" com.hermes.offsite-pull com.hermes.restore-drill)
 
+# 1. Гейты ДО выгрузки: при отказе ничего ещё не тронуто.
+if ! fdesetup isactive >/dev/null; then
+  echo "filevault_off" >&2
+  exit 1
+fi
+# Скобочный шаблон: иначе pgrep находит саму эту оболочку, в командной
+# строке которой встречается искомый текст.
+if pgrep -f '[p]ull_backups_from_aeza' >/dev/null ||
+   pgrep -f '[h]ermes_backup.offsite_pull' >/dev/null; then
+  echo "pull_in_progress" >&2
+  exit 1
+fi
+# KF должен быть загружен сейчас: иначе возвращать в конце нечего, и
+# «восстановление» тихо ничего не сделает.
+launchctl print "$GUI/$KF" >/dev/null 2>&1 || {
+  echo "kf_agent_not_loaded_before_migration" >&2
+  exit 1
+}
+echo "гейты пройдены: FileVault активен, стягиваний нет, KF загружен"
+
+# 2. Трап ставится ДО цикла выгрузки. Иначе KF выгрузится первым, а падение
+#    на втором агенте оставит его выключенным — трап тогда ещё не действует.
+restore_kf_on_failure() {
+  code=$?
+  if [ "$code" -ne 0 ]; then
+    echo "возвращаю KF-агент после сбоя (код $code)" >&2
+    launchctl bootstrap "$GUI" ~/Library/LaunchAgents/"$KF".plist || true
+    launchctl print "$GUI/$KF" >/dev/null 2>&1 ||
+      echo "kf_restore_FAILED — вернуть вручную" >&2
+  fi
+}
+trap restore_kf_on_failure EXIT
+
+# 3. Выгрузка с обязательной проверкой результата.
+for label in "${AGENTS[@]}"; do
+  if launchctl print "$GUI/$label" >/dev/null 2>&1; then
+    launchctl bootout "$GUI/$label"
+  fi
+  if launchctl print "$GUI/$label" >/dev/null 2>&1; then
+    echo "agent_still_loaded $label" >&2
+    exit 1
+  fi
+  echo "  выгружен: $label"
+done
+
+# 4. Миграция лока и проверка его работоспособности — в том же блоке, под
+#    защитой того же трапа.
 LOCK="$HOME/Library/Application Support/offsite-sync/network.lock"
 mkdir -p "$(dirname "$LOCK")"
+if [ -L "$LOCK" ]; then
+  # Симлинк означает, что лок ведёт куда-то ещё: захват защитил бы не тот файл.
+  echo "lock_is_symlink" >&2
+  exit 1
+fi
 if [ -d "$LOCK" ]; then
   rm -f "$LOCK/meta.json"
   rmdir "$LOCK"
@@ -6627,37 +6687,118 @@ fi
 [ -e "$LOCK" ] || : >"$LOCK"
 chmod 600 "$LOCK"
 ls -l "$LOCK"
+
+cd /Users/romanmizanov/Documents/Hermes
+.venv/bin/python - <<'PY'
+from hermes_backup import config
+from hermes_backup.locks import FileLock, held_by
+
+lock = config.MAC_NETWORK_LOCK
+assert held_by(lock) is None, "лок занят до начала"
+with FileLock(lock, owner="migration-check"):
+    holder = held_by(lock)
+    assert holder is not None and holder["owner"] == "migration-check", holder
+assert held_by(lock) is None, "лок не освободился"
+print("lock_migration_OK: захват и освобождение работают")
+PY
+
+# Снимаем trap только теперь: дальше KF намеренно остаётся выключенным до
+# конца C2, чтобы не делить узкий канал с первым стягиванием Hermes.
+trap - EXIT
 ```
+
+Expected: строка о пройденных гейтах, три строки «выгружен», файл лока с
+режимом `600`, `lock_migration_OK`.
 
 - [ ] **Step C2: Первый pull, drill и сводка**
 
+Один блок с `set -euo pipefail`: иначе упавший pull не остановил бы drill, а
+успешная сводка замаскировала бы провал нулевым кодом. `EXIT`-trap возвращает
+KF-агент при **любом** исходе и сам становится причиной неуспеха, если вернуть
+не удалось.
+
 ```bash
+set -euo pipefail
+GUI="gui/$(id -u)"
+KF=com.knowledge-factory.backup-pull
+
+restore_kf_always() {
+  code=$?
+  if ! launchctl print "$GUI/$KF" >/dev/null 2>&1; then
+    launchctl bootstrap "$GUI" ~/Library/LaunchAgents/"$KF".plist || true
+  fi
+  if ! launchctl print "$GUI/$KF" >/dev/null 2>&1; then
+    echo "kf_restore_FAILED" >&2
+    # Успешный C2 обязан стать неуспешным: off-site KF важнее зелёного отчёта.
+    exit 1
+  fi
+  echo "KF-агент загружен"
+  exit "$code"
+}
+trap restore_kf_always EXIT
+
 cd /Users/romanmizanov/Documents/Hermes
 deploy/macos/hermes_pull_offsite.sh
 deploy/macos/hermes_restore_drill.sh
 deploy/macos/hermes_backup_status.sh
 ```
 
-Expected: `hermes_offsite_pull_OK`, `hermes_freshness_OK`,
-`hermes_restore_drill_OK sessions=2 skills=78 plugins=3 cron_jobs=… unclassified=…`.
-Если `unclassified` больше нуля — посмотреть `INVENTORY.jsonl` и решить,
-дополнять ли `ESSENTIAL_RULES`. Стягивание идёт по узкому каналу и может занять
-десятки минут.
+Expected — контрактные критерии, без конкретных чисел:
+
+- `hermes_offsite_pull_OK` и `hermes_freshness_OK`;
+- `hermes_restore_drill_OK`, и в нём счётчики совпали со `STATE`;
+- `unclassified=0` — правила классификации покрывают всё, что есть в дереве;
+- сводка показывает возраст свежайшего бэкапа и «network lock: free»;
+- завершающая строка «KF-агент загружен».
+
+Конкретные значения счётчиков в runbook не фиксируются: они меняются вместе с
+живым деревом, и записанное число превратилось бы в ложный критерий.
+
+Стягивание идёт по узкому каналу и может занять десятки минут.
 
 - [ ] **Step C3: Установить и вернуть агенты**
 
+KF к этому моменту уже загружен трапом из C2, поэтому шаг устроен идемпотентно:
+`bootstrap` выполняется только для отсутствующих label'ов, а `launchctl print`
+проверяется всегда. Повторный запуск шага безопасен.
+
 ```bash
 set -euo pipefail
+GUI="gui/$(id -u)"
+REPO=/Users/romanmizanov/Documents/Hermes
 mkdir -p ~/Library/Logs/hermes-backup
-cp /Users/romanmizanov/Documents/Hermes/deploy/macos/com.hermes.offsite-pull.plist ~/Library/LaunchAgents/
-cp /Users/romanmizanov/Documents/Hermes/deploy/macos/com.hermes.restore-drill.plist ~/Library/LaunchAgents/
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.hermes.offsite-pull.plist
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.hermes.restore-drill.plist
-# KF-агент уже вернулся в Step A9 и его скрипты там же установлены —
-# повторно ставить и загружать нечего.
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.knowledge-factory.backup-pull.plist 2>/dev/null || true
+
+# Проверить plist до установки: launchctl примет синтаксически битый файл
+# молча и просто не запустит задачу.
+for plist in "$REPO/deploy/macos/com.hermes.offsite-pull.plist" \
+             "$REPO/deploy/macos/com.hermes.restore-drill.plist" \
+             ~/Library/LaunchAgents/com.knowledge-factory.backup-pull.plist; do
+  plutil -lint "$plist"
+done
+
+install -m 0644 "$REPO/deploy/macos/com.hermes.offsite-pull.plist" ~/Library/LaunchAgents/
+install -m 0644 "$REPO/deploy/macos/com.hermes.restore-drill.plist" ~/Library/LaunchAgents/
+
+ensure_loaded() {
+  label="$1"
+  if ! launchctl print "$GUI/$label" >/dev/null 2>&1; then
+    launchctl bootstrap "$GUI" ~/Library/LaunchAgents/"$label".plist
+  fi
+  # Без `|| true`: если агент не загрузился, шаг обязан упасть здесь.
+  launchctl print "$GUI/$label" >/dev/null
+  echo "  загружен: $label"
+}
+
+# KF первым: его off-site backup работал до этой выкатки.
+ensure_loaded com.knowledge-factory.backup-pull
+ensure_loaded com.hermes.offsite-pull
+ensure_loaded com.hermes.restore-drill
+
 launchctl list | grep -E "com.hermes|knowledge-factory"
 ```
+
+Expected: `plutil -lint` подтверждает все три файла; все три label'а загружены
+и проходят `launchctl print`.
 
 - [ ] **Step C4: Обновить документацию и закоммитить**
 
