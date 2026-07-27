@@ -41,6 +41,15 @@ def write_status(
     directory.mkdir(parents=True, exist_ok=True)
     directory.chmod(0o700)
     target = directory / f"{name}.json"
+    finished_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    last_ok_at = finished_at if outcome == "OK" else ""
+    if not last_ok_at:
+        previous = read_status(directory, name)
+        if previous:
+            if previous["outcome"] == "OK":
+                last_ok_at = previous["finished_at"]
+            else:
+                last_ok_at = str(previous.get("last_ok_at", ""))
     atomic_write_text(
         target,
         json.dumps(
@@ -49,9 +58,8 @@ def write_status(
                 "outcome": outcome,
                 "reason": reason,
                 "backup_path": backup_path,
-                "finished_at": datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
+                "finished_at": finished_at,
+                "last_ok_at": last_ok_at,
             },
             ensure_ascii=False,
         )

@@ -1,0 +1,11 @@
+[Unit]
+Description=Queue an operational alert for failed unit %i
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=PYTHONPATH=/srv/hermes/app
+ExecStart=/usr/bin/python3 -m hermes_alerts --config /srv/hermes/data/config.yaml --profile aeza record-systemd-failure --unit %i
+

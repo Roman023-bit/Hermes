@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry queued operational alerts every two minutes
+
+[Timer]
+OnBootSec=1m
+OnUnitInactiveSec=2m
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+

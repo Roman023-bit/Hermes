@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes production container and gateway healthcheck
+Requires=docker.service
+After=docker.service
+OnFailure=hermes-alert@%n.service
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=PYTHONPATH=/srv/hermes/app
+ExecStart=/usr/bin/python3 -m hermes_alerts.healthcheck --state-root /var/lib/hermes-alerts --status-dir /var/lib/hermes-alerts/status
+

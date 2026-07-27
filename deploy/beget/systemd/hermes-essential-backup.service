@@ -1,6 +1,7 @@
 [Unit]
 Description=Hermes essential off-site backup
 After=docker.service
+OnFailure=hermes-alert@%n.service
 
 [Service]
 Type=oneshot

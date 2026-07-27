@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hermes.alert-delivery</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/romanmizanov/Documents/Hermes/deploy/macos/hermes_alerts.sh</string>
+    <string>deliver</string>
+    <string>--env-file</string>
+    <string>/Users/romanmizanov/.hermes/.env</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>120</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/romanmizanov/Library/Logs/hermes-alerts/delivery.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/romanmizanov/Library/Logs/hermes-alerts/delivery.err.log</string>
+</dict>
+</plist>
+

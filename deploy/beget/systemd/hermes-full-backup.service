@@ -1,6 +1,7 @@
 [Unit]
 Description=Hermes full local archive
 After=docker.service
+OnFailure=hermes-alert@%n.service
 
 [Service]
 Type=oneshot

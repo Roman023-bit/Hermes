@@ -1,0 +1,13 @@
+[Unit]
+Description=Deliver queued Hermes operational alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=PYTHONPATH=/srv/hermes/app
+ExecStart=/usr/bin/python3 -m hermes_alerts --config /srv/hermes/data/config.yaml --profile aeza deliver --env-file /srv/hermes/data/.env
+

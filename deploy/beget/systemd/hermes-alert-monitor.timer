@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Aeza operational task silence every five minutes
+
+[Timer]
+OnBootSec=4m
+OnUnitInactiveSec=5m
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+

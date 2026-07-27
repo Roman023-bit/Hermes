@@ -29,6 +29,19 @@ def test_failure_keeps_the_reason(tmp_path):
     assert read_status(tmp_path, "restore_drill")["reason"] == "integrity_check"
 
 
+def test_skipped_run_preserves_last_success_for_silence_monitor(tmp_path):
+    write_status(tmp_path, "full_backup", "OK")
+    previous = read_status(tmp_path, "full_backup")["finished_at"]
+    write_status(tmp_path, "full_backup", "SKIPPED", reason="locked")
+    record = read_status(tmp_path, "full_backup")
+    assert record["last_ok_at"] == previous
+
+
+def test_failure_without_previous_success_has_empty_last_ok(tmp_path):
+    write_status(tmp_path, "restore_drill", "FAILED", reason="boom")
+    assert read_status(tmp_path, "restore_drill")["last_ok_at"] == ""
+
+
 def test_missing_status_reads_as_none(tmp_path):
     assert read_status(tmp_path, "never_ran") is None
 
