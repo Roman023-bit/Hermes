@@ -23,7 +23,7 @@ from .storage import (
 )
 from .telegram import DeliveryError, render_message, send_message
 
-_SAFE_UNIT = re.compile(r"\A[a-zA-Z0-9_.@:-]+\\.service\Z")
+_SAFE_UNIT = re.compile(r"\A[a-zA-Z0-9_.@:-]+\.service\Z")
 
 
 def _load(args):

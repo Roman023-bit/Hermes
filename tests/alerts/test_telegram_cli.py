@@ -105,3 +105,10 @@ def test_invalid_outbox_record_is_quarantined(tmp_path, monkeypatch):
         == 0
     )
     assert (settings.state_root / "bad" / "broken.json").exists()
+
+
+def test_systemd_unit_validator_accepts_units_not_paths():
+    assert cli._SAFE_UNIT.match("knowledge-factory-backup.service")
+    assert cli._SAFE_UNIT.match("hermes-alert-drill.service")
+    assert not cli._SAFE_UNIT.match("../../escape.service")
+    assert not cli._SAFE_UNIT.match("timer.timer")
