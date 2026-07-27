@@ -121,4 +121,8 @@ not just loaded, and exited successfully from the installed runtime.
 Knowledge Factory sync exposed one additional live-tree edge:
 `runtime/logs` and `runtime/legacy-logs` mutate while rsync runs. They are now
 excluded symmetrically from the raw manifest and transfer. The failed run
-published `FAILED`; the repeated full sync published `OK`.
+published `FAILED`; the repeated full sync published `OK`. During final
+integration tests OrbStack later became genuinely unavailable: the deployed
+monitor delivered one `FAILED`, then one `RECOVERED` after a successful real
+sync. The production transition and deduplication path was therefore exercised
+without editing a status file.

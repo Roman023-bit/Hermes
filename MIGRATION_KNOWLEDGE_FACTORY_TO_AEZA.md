@@ -1432,7 +1432,12 @@ freshness и drill Hermes, а также pull и sync KF.
   delivery завершился с кодом 0 и очистил outbox;
 - KF sync сначала честно опубликовал `FAILED`: raw mirror захватывал
   изменяющиеся `runtime/logs` и `runtime/legacy-logs`. Эти каталоги исключены
-  и из raw manifest, и из rsync; повторный полный sync завершился `OK`.
+  и из raw manifest, и из rsync; повторный полный sync завершился `OK`;
+- при финальном полном тесте локальный OrbStack действительно стал
+  недоступен, status снова перешёл в `FAILED`, монитор доставил одно
+  уведомление, а после восстановления и успешного sync — ровно один
+  `RECOVERED`. Это живое доказательство переходов, а не синтетическая
+  подмена status-файла.
 
 MacOS не разрешил новым LaunchAgent читать checkout Hermes из `~/Documents`:
 загрузка label'а проходила, а первый реальный RunAtLoad завершался
