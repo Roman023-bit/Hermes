@@ -166,11 +166,20 @@ def _check_inventory(backup: Path, tree: Path, workdir: Path, state: dict) -> No
 
 
 def _secret_paths(tree: Path):
-    for name in SECRETS:
-        path = tree / name
-        if path.exists():
+    """Every file whose contents must stay owner-only.
+
+    The historical configs matter as much as the live one: config.yaml.bak-*
+    and config.yaml.pre-* carry the same provider keys and travel in the
+    same archive.
+    """
+    candidates = [tree / name for name in SECRETS]
+    candidates += sorted(tree.glob(".env*"))
+    candidates += sorted(tree.glob("config.yaml.*"))
+    for path in candidates:
+        # lexists, not exists: a dangling symlink must be seen and rejected,
+        # not silently skipped as "no such secret".
+        if os.path.lexists(path):
             yield path
-    yield from sorted(tree.glob(".env*"))
 
 
 def _check_token_store(tree: Path) -> None:
@@ -226,12 +235,17 @@ def _check_token_store(tree: Path) -> None:
 
 def _require_private_modes(tree: Path) -> None:
     for path in _secret_paths(tree):
+        rel = path.relative_to(tree)
+        if path.is_symlink():
+            raise DrillError(f"secret_not_a_regular_file {rel} (symlink)")
+        if not path.is_file():
+            raise DrillError(f"secret_not_a_regular_file {rel}")
         mode = stat.S_IMODE(path.stat().st_mode)
         # Anything outside owner read/write is wrong for a secret, execute
         # included: 0700 is not "no wider than 0600", it is a different mode
         # nothing in this tree should ever have.
         if mode & ~0o600:
-            raise DrillError(f"permissions_too_wide {path.relative_to(tree)} {mode:o}")
+            raise DrillError(f"permissions_too_wide {rel} {mode:o}")
 
 
 def drill(

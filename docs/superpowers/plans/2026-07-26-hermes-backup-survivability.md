@@ -4700,8 +4700,11 @@ git commit -m "feat(backup): pull the off-site copy behind a FileVault gate"
    пересчитанный `INVENTORY.jsonl` — число файлов, суммарные байты и
    `unclassified`.
 4. **Обязательные объекты — обычные файлы**, а не каталоги и не ссылки.
-5. **Права проверяются у всех секретов:** `auth.json`, `config.yaml`, `.env*`,
-   `sessions/sessions.json`.
+5. **Права проверяются у всех секретов:** `auth.json`, `config.yaml`,
+   **`config.yaml.*`**, `.env*`, `sessions/sessions.json`. Исторические копии
+   конфига несут те же ключи провайдеров и едут в том же архиве. Существование
+   проверяется через `lexists`, поэтому висящая ссылка не читается как
+   «секрета нет», и каждый секрет обязан быть обычным файлом.
 6. **Очистка fail-closed:** успешный drill не возвращает `OK`, если временный
    каталог с секретами удалить не удалось.
 7. **`load_settings()` внутри обработки ошибок:** битый конфиг даёт
@@ -4942,6 +4945,60 @@ def test_broken_config_yields_a_failed_status_not_a_traceback(tmp_path):
     assert read_status(status_dir, "restore_drill")["outcome"] == "FAILED"
 
 
+def test_a_loose_historical_config_fails_the_whole_drill(tmp_path):
+    """config.yaml.bak-* carries the same provider keys as the live one."""
+    data = _fixture_tree(tmp_path)
+    backup = data / "config.yaml.bak-20260715T214953Z"
+    backup.write_text("model: opus\n")
+    backup.chmod(0o640)
+
+    published = run(data, tmp_path / "essential", snapshot_runner=_direct_runner)
+
+    with pytest.raises(
+        DrillError, match="permissions_too_wide config.yaml.bak-20260715T214953Z"
+    ):
+        drill(published)
+
+def test_a_private_historical_config_passes(tmp_path):
+    data = _fixture_tree(tmp_path)
+    backup = data / "config.yaml.pre-cutover"
+    backup.write_text("model: opus\n")
+    backup.chmod(0o600)
+
+    published = run(data, tmp_path / "essential", snapshot_runner=_direct_runner)
+
+    assert drill(published)["sessions"] == 2
+
+def test_a_symlinked_secret_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _require_private_modes
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tmp_path / "elsewhere").write_text("secrets")
+    (tree / "auth.json").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(DrillError, match="secret_not_a_regular_file auth.json"):
+        _require_private_modes(tree)
+
+def test_a_dangling_secret_symlink_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _require_private_modes
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / ".env").symlink_to(tmp_path / "nowhere")
+    with pytest.raises(DrillError, match="secret_not_a_regular_file .env"):
+        _require_private_modes(tree)
+
+
+def test_a_directory_in_place_of_a_secret_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _require_private_modes
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "config.yaml").mkdir()
+    with pytest.raises(DrillError, match="secret_not_a_regular_file config.yaml"):
+        _require_private_modes(tree)
+
+
 def test_drill_makes_no_network_or_container_calls(tmp_path):
     """Stub docker/ssh/curl so any call aborts, then run the real drill."""
     published = _published(tmp_path)
@@ -5131,72 +5188,35 @@ def _check_inventory(backup: Path, tree: Path, workdir: Path, state: dict) -> No
 
 
 def _secret_paths(tree: Path):
-    for name in SECRETS:
-        path = tree / name
-        if path.exists():
-            yield path
-    yield from sorted(tree.glob(".env*"))
+    """Every file whose contents must stay owner-only.
 
-
-def _check_token_store(tree: Path) -> None:
-    """OAuth tokens live here, so nothing about this directory is optional.
-
-    The store itself may be absent — not every deployment has one — but if
-    anything is there it must be a plain directory of plain files, all
-    unreadable to anyone else, and every JSON in it must still parse.
+    The historical configs matter as much as the live one: config.yaml.bak-*
+    and config.yaml.pre-* carry the same provider keys and travel in the
+    same archive.
     """
-    store = tree / TOKEN_STORE
-    # is_symlink before exists: a dangling symlink answers False to exists()
-    # and would slip through as "no store at all".
-    if store.is_symlink():
-        raise DrillError(f"token_store_not_a_directory {TOKEN_STORE}")
-    if not store.exists():
-        return
-    if not store.is_dir():
-        raise DrillError(f"token_store_not_a_directory {TOKEN_STORE}")
-    mode = stat.S_IMODE(store.stat().st_mode)
-    if mode != 0o700:
-        raise DrillError(f"token_store_mode {TOKEN_STORE} {mode:o}")
-
-    # os.walk without following links: rglob would descend into a symlinked
-    # directory before we ever got to reject it.
-    for dirpath, dirnames, filenames in os.walk(store, followlinks=False):
-        base = Path(dirpath)
-        for name in sorted(dirnames):
-            path = base / name
-            rel = path.relative_to(tree)
-            if path.is_symlink():
-                raise DrillError(f"token_store_symlink {rel}")
-            directory_mode = stat.S_IMODE(path.stat().st_mode)
-            # A readable directory leaks the file names, which name the
-            # providers a token exists for.
-            if directory_mode != 0o700:
-                raise DrillError(f"token_store_mode {rel} {directory_mode:o}")
-        for name in sorted(filenames):
-            path = base / name
-            rel = path.relative_to(tree)
-            if path.is_symlink():
-                raise DrillError(f"token_store_symlink {rel}")
-            if not path.is_file():
-                raise DrillError(f"token_store_special {rel}")
-            file_mode = stat.S_IMODE(path.stat().st_mode)
-            if file_mode & ~0o600:
-                raise DrillError(f"permissions_too_wide {rel} {file_mode:o}")
-            if path.suffix == ".json":
-                try:
-                    json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise DrillError(f"token_unparsable {rel}: {error}") from error
+    candidates = [tree / name for name in SECRETS]
+    candidates += sorted(tree.glob(".env*"))
+    candidates += sorted(tree.glob("config.yaml.*"))
+    for path in candidates:
+        # lexists, not exists: a dangling symlink must be seen and rejected,
+        # not silently skipped as "no such secret".
+        if os.path.lexists(path):
+            yield path
 
 
 def _require_private_modes(tree: Path) -> None:
     for path in _secret_paths(tree):
+        rel = path.relative_to(tree)
+        if path.is_symlink():
+            raise DrillError(f"secret_not_a_regular_file {rel} (symlink)")
+        if not path.is_file():
+            raise DrillError(f"secret_not_a_regular_file {rel}")
         mode = stat.S_IMODE(path.stat().st_mode)
         # Anything outside owner read/write is wrong for a secret, execute
         # included: 0700 is not "no wider than 0600", it is a different mode
         # nothing in this tree should ever have.
         if mode & ~0o600:
-            raise DrillError(f"permissions_too_wide {path.relative_to(tree)} {mode:o}")
+            raise DrillError(f"permissions_too_wide {rel} {mode:o}")
 
 
 def drill(
@@ -6607,6 +6627,12 @@ Expected: `old_cron_removed_OK (0 строк осталось)`. Провере�
 Все проверки здесь — условия выхода. Шаг, который печатает предупреждение и
 продолжает, хуже отсутствующего шага: он создаёт видимость проверки.
 
+**Каждый шаг запускается явно неинтерактивной оболочкой** — `/bin/bash -s` с
+here-doc. Это не украшение: в интерактивной оболочке bash игнорирует `errexit`,
+и проверено 2026-07-27, что при запуске тех же строк в интерактивной сессии
+сводка выполнилась после упавшего drill'а. Обёртка гарантирует, что `set -e` и
+`EXIT`-trap работают независимо от того, чем набирают команды.
+
 Сквозное правило фазы: **off-site backup Knowledge Factory не должен остаться
 выключенным из-за сбоя в Hermes-части**. Он работал до этой выкатки, и любая
 наша неудача обязана вернуть его в строй.
@@ -6621,6 +6647,7 @@ Expected: `old_cron_removed_OK (0 строк осталось)`. Провере�
 раньше.
 
 ```bash
+/bin/bash -s <<'C1'
 set -euo pipefail
 GUI="gui/$(id -u)"
 KF=com.knowledge-factory.backup-pull
@@ -6705,6 +6732,7 @@ PY
 # Снимаем trap только теперь: дальше KF намеренно остаётся выключенным до
 # конца C2, чтобы не делить узкий канал с первым стягиванием Hermes.
 trap - EXIT
+C1
 ```
 
 Expected: строка о пройденных гейтах, три строки «выгружен», файл лока с
@@ -6718,6 +6746,7 @@ KF-агент при **любом** исходе и сам становится 
 не удалось.
 
 ```bash
+/bin/bash -s <<'C2'
 set -euo pipefail
 GUI="gui/$(id -u)"
 KF=com.knowledge-factory.backup-pull
@@ -6741,6 +6770,7 @@ cd /Users/romanmizanov/Documents/Hermes
 deploy/macos/hermes_pull_offsite.sh
 deploy/macos/hermes_restore_drill.sh
 deploy/macos/hermes_backup_status.sh
+C2
 ```
 
 Expected — контрактные критерии, без конкретных чисел:
@@ -6763,6 +6793,7 @@ KF к этому моменту уже загружен трапом из C2, п
 проверяется всегда. Повторный запуск шага безопасен.
 
 ```bash
+/bin/bash -s <<'C3'
 set -euo pipefail
 GUI="gui/$(id -u)"
 REPO=/Users/romanmizanov/Documents/Hermes
@@ -6795,6 +6826,7 @@ ensure_loaded com.hermes.offsite-pull
 ensure_loaded com.hermes.restore-drill
 
 launchctl list | grep -E "com.hermes|knowledge-factory"
+C3
 ```
 
 Expected: `plutil -lint` подтверждает все три файла; все три label'а загружены

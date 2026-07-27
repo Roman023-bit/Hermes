@@ -457,3 +457,60 @@ def test_a_loose_token_fails_the_whole_drill(tmp_path):
 
     with pytest.raises(DrillError, match="permissions_too_wide mcp-tokens/vercel.json"):
         drill(published)
+
+
+def test_a_loose_historical_config_fails_the_whole_drill(tmp_path):
+    """config.yaml.bak-* carries the same provider keys as the live one."""
+    data = _fixture_tree(tmp_path)
+    backup = data / "config.yaml.bak-20260715T214953Z"
+    backup.write_text("model: opus\n")
+    backup.chmod(0o640)
+
+    published = run(data, tmp_path / "essential", snapshot_runner=_direct_runner)
+
+    with pytest.raises(
+        DrillError, match="permissions_too_wide config.yaml.bak-20260715T214953Z"
+    ):
+        drill(published)
+
+
+def test_a_private_historical_config_passes(tmp_path):
+    data = _fixture_tree(tmp_path)
+    backup = data / "config.yaml.pre-cutover"
+    backup.write_text("model: opus\n")
+    backup.chmod(0o600)
+
+    published = run(data, tmp_path / "essential", snapshot_runner=_direct_runner)
+
+    assert drill(published)["sessions"] == 2
+
+
+def test_a_symlinked_secret_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _require_private_modes
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tmp_path / "elsewhere").write_text("secrets")
+    (tree / "auth.json").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(DrillError, match="secret_not_a_regular_file auth.json"):
+        _require_private_modes(tree)
+
+
+def test_a_dangling_secret_symlink_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _require_private_modes
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / ".env").symlink_to(tmp_path / "nowhere")
+    with pytest.raises(DrillError, match="secret_not_a_regular_file .env"):
+        _require_private_modes(tree)
+
+
+def test_a_directory_in_place_of_a_secret_is_rejected(tmp_path):
+    from hermes_backup.restore_drill import _require_private_modes
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "config.yaml").mkdir()
+    with pytest.raises(DrillError, match="secret_not_a_regular_file config.yaml"):
+        _require_private_modes(tree)
