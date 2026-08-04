@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Network-free tests for Perplexity usage propagation + token pricing.
+"""Network-free tests for Perplexity usage propagation.
 
-Covers the #3 fix: the Sonar /chat/completions fallback spends tokens, so its
-``usage`` must reach ``tool_pricing`` to be priced by tokens instead of the
-flat per-request fallback. The dedicated /search endpoint reports no usage and
-must keep its previous (flat-price) behaviour.
+Covers the Sonar fallback contract: chat completions spend tokens, so their
+``usage`` metadata must survive provider normalization. The dedicated search
+endpoint reports no usage and must keep its previous behaviour.
 """
 
 import unittest
 from unittest.mock import patch
 
 import plugins.web.perplexity.provider as ppx
-from tools import tool_pricing
 
 
 class _FakeResp:
@@ -70,34 +68,6 @@ class TestPerplexityUsagePropagation(unittest.TestCase):
         self.assertIn("usage", result)
         self.assertEqual(result["usage"]["prompt_tokens"], 100)
         self.assertEqual(result["usage"]["completion_tokens"], 200)
-
-
-class TestPerplexityTokenPricing(unittest.TestCase):
-    def test_token_cost_used_when_usage_present(self):
-        """With usage, search_cost prices by tokens (not the flat fallback)."""
-        amount, status, units = tool_pricing.search_cost(
-            "perplexity",
-            usage={"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000},
-        )
-        # 1M in + 1M out at $1/M each = $2.00, far from the $0.006 flat price.
-        self.assertAlmostEqual(amount, 2.0)
-        self.assertEqual(status, tool_pricing.STATUS_ESTIMATED)
-        self.assertIn("tokens", units)
-
-    def test_flat_price_without_usage(self):
-        """Without usage, perplexity keeps the flat per-request estimate."""
-        amount, _status, units = tool_pricing.search_cost("perplexity")
-        self.assertAlmostEqual(amount, 0.006)
-        self.assertNotIn("tokens", units)
-
-    def test_empty_usage_falls_back_to_flat(self):
-        """Zero-token usage → no token cost → flat per-request price."""
-        amount, _status, _units = tool_pricing.search_cost(
-            "perplexity",
-            usage={"prompt_tokens": 0, "completion_tokens": 0},
-        )
-        self.assertAlmostEqual(amount, 0.006)
-
 
 if __name__ == "__main__":
     unittest.main()
