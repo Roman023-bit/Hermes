@@ -41,6 +41,7 @@ def _holder(path: Path) -> subprocess.Popen:
     return process
 
 
+@pytest.mark.live_system_guard_bypass
 def test_second_process_cannot_take_a_held_lock(tmp_path):
     path = tmp_path / "network.lock"
     holder = _holder(path)
@@ -52,6 +53,7 @@ def test_second_process_cannot_take_a_held_lock(tmp_path):
         holder.wait()
 
 
+@pytest.mark.live_system_guard_bypass
 def test_killing_the_owner_frees_the_lock(tmp_path):
     path = tmp_path / "network.lock"
     holder = _holder(path)
@@ -62,6 +64,7 @@ def test_killing_the_owner_frees_the_lock(tmp_path):
         assert held_by(path)["owner"] == "hermes-pull"
 
 
+@pytest.mark.live_system_guard_bypass
 def test_metadata_age_never_frees_a_live_lock(tmp_path):
     path = tmp_path / "network.lock"
     holder = _holder(path)
@@ -76,6 +79,7 @@ def test_metadata_age_never_frees_a_live_lock(tmp_path):
         holder.wait()
 
 
+@pytest.mark.live_system_guard_bypass
 def test_positive_wait_raises_timeout_after_waiting(tmp_path):
     path = tmp_path / "network.lock"
     holder = _holder(path)
@@ -89,6 +93,7 @@ def test_positive_wait_raises_timeout_after_waiting(tmp_path):
         holder.wait()
 
 
+@pytest.mark.live_system_guard_bypass
 def test_a_foreign_instance_cannot_release_the_lock(tmp_path):
     path = tmp_path / "network.lock"
     holder = _holder(path)
