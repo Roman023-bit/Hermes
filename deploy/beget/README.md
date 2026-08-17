@@ -166,6 +166,22 @@ Both pullers — Hermes and Knowledge Factory — share one `fcntl.flock` file
 at `~/Library/Application Support/offsite-sync/network.lock`, because the
 uplink is narrow and a Knowledge Factory transfer can run for hours.
 
+The Hermes pull is pinned to the Mac's `en0` interface by default, so SSH and
+rsync do not move the backup through an active VPN tunnel. The binding is
+deliberately fail-closed: if `en0` is down or disappears, the pull fails and
+the emitted `hermes_offsite_pull_FAILED` status names the selected interface;
+it never retries over an unbound route. Before replacing the Mac, changing
+Ethernet/Wi-Fi hardware, or renaming interfaces, verify the route with
+`ifconfig en0` and override it for an operational test when needed:
+
+```sh
+deploy/macos/hermes_pull_offsite.sh --bind-interface en7
+```
+
+Once the correct persistent interface is known, update
+`MAC_SSH_BIND_INTERFACE` in `hermes_backup/config.py` and reinstall/restart the
+LaunchAgent through the normal operations runbook.
+
 The drill proves the pulled copy restores **without starting anything**: it
 never launches the container, the gateway or Telegram, since the archive
 holds live tokens and a second poller would answer twice. It checks the

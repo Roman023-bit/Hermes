@@ -29,6 +29,7 @@ MAC_CONFIG = Path("~/.hermes/config.yaml").expanduser()
 
 REMOTE = "root@138.124.108.97"
 SSH_KEY = Path("~/.ssh/aeza_hermes").expanduser()
+MAC_SSH_BIND_INTERFACE = "en0"
 
 DEFAULTS: dict[str, int] = {
     "retention_server": 7,

@@ -35,11 +35,17 @@ STAMP = re.compile(r"\Adaily-[0-9]{8}T[0-9]{6}Z\Z")
 _DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
-def _ssh_command(key: Path) -> str:
+def _ssh_command(key: Path, bind_interface: str | None = None) -> str:
+    bind = f"-o BindInterface={bind_interface} " if bind_interface else ""
     return (
-        f"ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 "
-        f"-o ServerAliveCountMax=12 -i {key}"
+        f"ssh {bind}-o BatchMode=yes -o ConnectTimeout=15 "
+        f"-o ServerAliveInterval=15 -o ServerAliveCountMax=12 -i {key}"
     )
+
+
+def _bind_context(bind_interface: str | None) -> str:
+    """Describe the selected route without weakening fail-closed behavior."""
+    return f" bind_interface={bind_interface}" if bind_interface else ""
 
 
 def _read_text(path: Path) -> str:
@@ -98,10 +104,20 @@ def verify_backup(directory: Path) -> dict:
         raise RuntimeError(f"state_invalid {error}") from error
 
 
-def _latest_remote(remote: str, key: Path, remote_root: str, runner) -> str:
+def _latest_remote(
+    remote: str,
+    key: Path,
+    remote_root: str,
+    runner,
+    bind_interface: str | None = None,
+) -> str:
+    bind_options = (
+        ["-o", f"BindInterface={bind_interface}"] if bind_interface else []
+    )
     result = runner(
         [
             "ssh",
+            *bind_options,
             "-o",
             "BatchMode=yes",
             "-o",
@@ -117,7 +133,10 @@ def _latest_remote(remote: str, key: Path, remote_root: str, runner) -> str:
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"ssh_failed ({result.returncode}): {result.stderr.strip()}")
+        raise RuntimeError(
+            f"ssh_failed ({result.returncode}){_bind_context(bind_interface)}: "
+            f"{result.stderr.strip()}"
+        )
     name = result.stdout.strip()
     if not STAMP.match(name):
         raise RuntimeError(f"invalid_remote_name {name!r}")
@@ -136,10 +155,11 @@ def pull(
     key: Path,
     remote_root: str = "/srv/hermes/backups/essential",
     runner=subprocess.run,
+    bind_interface: str | None = None,
 ) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
-    name = _latest_remote(remote, key, remote_root, runner)
+    name = _latest_remote(remote, key, remote_root, runner, bind_interface)
     published = root / name
     if published.exists():
         verify_backup(published)
@@ -156,7 +176,7 @@ def pull(
                 "-a",
                 "--partial",
                 "-e",
-                _ssh_command(key),
+                _ssh_command(key, bind_interface),
                 f"{remote}:{remote_root}/{name}/",
                 f"{partial}/",
             ],
@@ -166,7 +186,8 @@ def pull(
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"rsync_failed ({result.returncode}): {result.stderr.strip()}"
+                f"rsync_failed ({result.returncode})"
+                f"{_bind_context(bind_interface)}: {result.stderr.strip()}"
             )
         _apply_modes(partial)
         # Verify before the rename: nothing may become visible as a backup
@@ -211,6 +232,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=config.MAC_OFFSITE_ROOT)
     parser.add_argument("--status-dir", type=Path, default=config.MAC_STATUS_DIR)
     parser.add_argument("--config", type=Path, default=config.MAC_CONFIG)
+    parser.add_argument(
+        "--bind-interface",
+        default=config.MAC_SSH_BIND_INTERFACE,
+        help=(
+            "macOS interface used by SSH and rsync "
+            f"(default: {config.MAC_SSH_BIND_INTERFACE})"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         settings = load_settings(args.config)
@@ -231,7 +260,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     try:
-        published = pull(args.root, config.REMOTE, config.SSH_KEY)
+        published = pull(
+            args.root,
+            config.REMOTE,
+            config.SSH_KEY,
+            bind_interface=args.bind_interface,
+        )
         prune(args.root, settings.retention_mac, settings.retention_mac_floor)
     except BaseException as error:  # noqa: BLE001 — status must always be emitted
         write_status(args.status_dir, "offsite_pull", "FAILED", reason=str(error))

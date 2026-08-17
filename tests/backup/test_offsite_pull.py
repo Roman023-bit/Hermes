@@ -78,10 +78,12 @@ class _Runner:
         self.ssh_code = ssh_code
         self.rsync_code = rsync_code
         self.calls: list[str] = []
+        self.argvs: list[list[str]] = []
 
     def __call__(self, argv, **kwargs):
         program = Path(argv[0]).name
         self.calls.append(program)
+        self.argvs.append(argv)
         if program == "ssh":
             return subprocess.CompletedProcess(
                 argv,
@@ -107,7 +109,13 @@ def test_pull_publishes_atomically_with_private_modes(tmp_path):
     root = tmp_path / "offsite"
     runner = _Runner(fixture)
 
-    published = pull(root, "root@host", tmp_path / "key", runner=runner)
+    published = pull(
+        root,
+        "root@host",
+        tmp_path / "key",
+        runner=runner,
+        bind_interface="en0",
+    )
 
     assert published.name == f"daily-{STAMP}"
     assert not list(root.glob(".*partial"))
@@ -115,6 +123,8 @@ def test_pull_publishes_atomically_with_private_modes(tmp_path):
     for name in BACKUP_FILES:
         assert (published / name).stat().st_mode & 0o777 == 0o600
     assert runner.calls == ["ssh", "rsync"]
+    assert "BindInterface=en0" in runner.argvs[0]
+    assert "BindInterface=en0" in runner.argvs[1][runner.argvs[1].index("-e") + 1]
 
 
 def test_ssh_failure_is_reported_and_publishes_nothing(tmp_path):
@@ -127,6 +137,20 @@ def test_ssh_failure_is_reported_and_publishes_nothing(tmp_path):
 
     assert runner.calls == ["ssh"]
     assert not list(root.glob("daily-*"))
+
+
+def test_bound_ssh_failure_names_the_interface(tmp_path):
+    fixture = _make_backup(tmp_path / "fixture")
+    runner = _Runner(fixture, ssh_code=255)
+
+    with pytest.raises(RuntimeError, match=r"ssh_failed \(255\) bind_interface=en7"):
+        pull(
+            tmp_path / "offsite",
+            "root@host",
+            tmp_path / "key",
+            runner=runner,
+            bind_interface="en7",
+        )
 
 
 def test_rsync_failure_carries_stderr_and_leaves_no_visible_backup(tmp_path):
@@ -252,6 +276,37 @@ def test_filevault_off_makes_no_network_call(tmp_path, monkeypatch):
 
     assert code == 1
     assert calls == []
+
+
+def test_main_allows_bind_interface_override(tmp_path, monkeypatch):
+    import hermes_backup.offsite_pull as module
+
+    seen: dict[str, str | None] = {}
+    backup = _make_backup(tmp_path / "offsite" / f"daily-{STAMP}")
+
+    def fake_pull(*args, **kwargs):
+        seen["bind_interface"] = kwargs.get("bind_interface")
+        return backup
+
+    monkeypatch.setattr(module, "require_filevault", lambda: None)
+    monkeypatch.setattr(module.config, "MAC_NETWORK_LOCK", tmp_path / "network.lock")
+    monkeypatch.setattr(module, "pull", fake_pull)
+    monkeypatch.setattr(module, "prune", lambda *a, **k: None)
+    monkeypatch.setattr(module, "check_freshness", lambda *a, **k: backup)
+
+    code = module.main([
+        "--root",
+        str(tmp_path / "offsite"),
+        "--status-dir",
+        str(tmp_path / "status"),
+        "--config",
+        str(tmp_path / "absent.yaml"),
+        "--bind-interface",
+        "en7",
+    ])
+
+    assert code == 0
+    assert seen == {"bind_interface": "en7"}
 
 
 def test_launch_agent_carries_no_environment():
