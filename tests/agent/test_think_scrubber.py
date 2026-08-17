@@ -31,7 +31,14 @@ class TestClosedPairs:
 
     @pytest.mark.parametrize(
         "tag",
-        ["think", "thinking", "reasoning", "thought", "REASONING_SCRATCHPAD"],
+        [
+            "think",
+            "thinking",
+            "reasoning",
+            "thought",
+            "REASONING_SCRATCHPAD",
+            "mm:think",
+        ],
     )
     def test_all_tag_variants(self, tag: str) -> None:
         s = StreamingThinkScrubber()
@@ -62,6 +69,10 @@ class TestOrphanClose:
     def test_orphan_close_alone(self) -> None:
         s = StreamingThinkScrubber()
         assert _drive(s, ["Hello</think>world"]) == "Helloworld"
+
+    def test_minimax_orphan_close_split_across_deltas(self) -> None:
+        s = StreamingThinkScrubber()
+        assert _drive(s, ["</mm:", "think>Visible answer"]) == "Visible answer"
 
 
 

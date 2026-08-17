@@ -82,6 +82,7 @@ class StreamingThinkScrubber:
         "reasoning",
         "thought",
         "REASONING_SCRATCHPAD",
+        "mm:think",
     )
 
     # Materialise literal tag strings so the hot path does string

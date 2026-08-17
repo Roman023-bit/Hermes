@@ -52,7 +52,14 @@ logger = logging.getLogger(__name__)
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
 
 
-_REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
+_REASONING_TAG_NAMES = (
+    "think",
+    "thinking",
+    "reasoning",
+    "REASONING_SCRATCHPAD",
+    "thought",
+    "mm:think",
+)
 _TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
 
 _REASONING_BLOCK_PATTERNS = tuple(
@@ -810,8 +817,8 @@ def strip_think_blocks(agent, content: str) -> str:
          `` <think>`` in prose aren't over-stripped.
       3. Stray orphan open/close tags that slip through.
       4. Tag variants: `` <think>``, ``<thinking>``, ``<reasoning>``,
-         ``<REASONING_SCRATCHPAD>``, ``<thought>`` (Gemma 4), all
-         case-insensitive.
+         ``<REASONING_SCRATCHPAD>``, ``<thought>`` (Gemma 4), and
+         ``<mm:think>`` (MiniMax), all case-insensitive.
 
     Additionally strips standalone tool-call XML blocks that some open
     models (notably Gemma variants on OpenRouter) emit inside assistant

@@ -413,6 +413,16 @@ class TestStripThinkBlocks:
         assert "mixed" not in result
         assert "final" in result
 
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("<mm:think>hidden</mm:think>Visible", "Visible"),
+            ("</mm:think>Visible", "Visible"),
+        ],
+    )
+    def test_minimax_namespaced_think_tags_stripped(self, agent, text, expected):
+        assert agent._strip_think_blocks(text) == expected
+
     # ─── Tool-call XML block stripping (openclaw/openclaw#67318) ─────────
     # Some open models (notably Gemma variants via OpenRouter) emit
     # standalone tool-call XML inside assistant content instead of via the
