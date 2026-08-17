@@ -94,6 +94,48 @@ run `docker compose down -v` or `docker system prune -a` — the former can
 destroy the data volume, the latter is unnecessary and can remove images
 you still need for rollback.
 
+### Importing a new upstream Hermes release
+
+This repository is a flattened snapshot: its local history has no merge-base
+with the official Hermes history. Consequently, a normal merge cannot detect
+when an upstream release overwrites a local modification. Treat every upstream
+release as an explicit tree import and run the snapshot guard before changing
+the tree.
+
+The file `deploy/beget/upstream-base.txt` names the upstream release represented
+by the current snapshot. With a clean worktree and the new tag already fetched:
+
+```sh
+BASE="$(cat deploy/beget/upstream-base.txt)"
+TARGET=vYYYY.M.P
+BUNDLE="$(mktemp -d /tmp/hermes-update.XXXXXX)"
+python -m hermes_update.snapshot_guard prepare \
+  --baseline "$BASE" --target "$TARGET" --output "$BUNDLE"
+```
+
+`hermes_upstream_guard_BLOCKED` means upstream and the local layer touch at
+least one identical path. Stop and resolve every listed path deliberately; do
+not apply the generated patch. A successful preparation records every local
+path, blob ID, file mode and a digest of the binary patch.
+
+Build the candidate on a temporary branch. The restore below changes only the
+index and worktree; the current commit remains the rollback point:
+
+```sh
+git switch -c codex/update-hermes-vYYYY.M.P
+git restore --source="$TARGET" --staged --worktree -- .
+git apply --index "$BUNDLE/local-overlay.patch"
+python -m hermes_update.snapshot_guard verify --bundle "$BUNDLE"
+```
+
+Verification is fail-closed. It rejects unresolved collisions, a modified
+bundle, missing or extra overlay paths, content changes, mode changes, and
+unstaged edits. Only after `hermes_upstream_guard_OK` should you run the full
+test/build checks, replace `deploy/beget/upstream-base.txt` with the exact new
+tag, commit the snapshot, create a pre-update backup ref, fast-forward `main`,
+push, and run `deploy/beget/deploy.sh`. Keep the generated bundle until the new
+container and the local backup jobs have both been verified.
+
 ## Backups
 
 Two tiers, both scheduled by systemd timers on the VPS. `deploy/beget` is a
