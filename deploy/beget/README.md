@@ -108,15 +108,60 @@ by the current snapshot. With a clean worktree and the new tag already fetched:
 ```sh
 BASE="$(cat deploy/beget/upstream-base.txt)"
 TARGET=vYYYY.M.P
+# `mktemp -d` creates the private empty directory atomically; the guard accepts
+# that directory and refuses to write over any non-empty one.
 BUNDLE="$(mktemp -d /tmp/hermes-update.XXXXXX)"
 python -m hermes_update.snapshot_guard prepare \
   --baseline "$BASE" --target "$TARGET" --output "$BUNDLE"
 ```
 
-`hermes_upstream_guard_BLOCKED` means upstream and the local layer touch at
-least one identical path. Stop and resolve every listed path deliberately; do
-not apply the generated patch. A successful preparation records every local
-path, blob ID, file mode and a digest of the binary patch.
+A successful preparation records every preserved local path, blob ID, file mode,
+a digest of the binary patch, a digest of the manifest and a digest of the
+overlay policy.
+
+#### Collisions and the overlay policy
+
+A *collision* is a path that upstream and the local overlay both changed since
+`$BASE`. Every collision is classified by `deploy/beget/upstream-policy.yaml` —
+the one file to edit when the classification needs to change:
+
+| Strategy | Meaning at import |
+|---|---|
+| `must_preserve` | The collision is fatal. The import stops until you resolve the path by hand. |
+| `upstream_wins` | The collision is expected. **The local change on that path is discarded**: it is excluded from the overlay patch, so the imported tree keeps upstream's version. |
+
+A colliding path that no rule matches is *unclassified* and blocks the import.
+Silence is never consent. A missing, unreadable, malformed or ambiguous policy
+also blocks it — as does a path claimed by both strategies, which is reported
+rather than resolved by rule order.
+
+`upstream_wins` never means "invisible". Every discarded path is printed as a
+`hermes_upstream_guard_DISCARD` line with the rule's reason, and recorded in the
+manifest under `discarded_paths` / `discarded_entries` / `discarded_reasons`.
+That is the operator's review list — read it on every import:
+
+```sh
+jq -r '.discarded_paths[]' "$BUNDLE/manifest.json"
+# and, to see exactly what is being given up:
+jq -r '.discarded_entries | to_entries[] | "\(.key) \(.value.object)"' \
+  "$BUNDLE/manifest.json" |
+  while read -r path blob; do
+    echo "=== $path"; git diff "$TARGET:$path" "$blob"
+  done
+```
+
+`hermes_upstream_guard_BLOCKED` lists each blocking path with its label
+(`must_preserve` or `unclassified`) and exits 2. Stop and resolve every listed
+path deliberately; do not apply the generated patch. Discards are printed on a
+blocked run too, so one report always shows the whole picture.
+
+Currently `.github/workflows/*` is the only `upstream_wins` rule: the local
+workflow snapshot is intentionally disposable at release import, and re-applying
+it every time would pin CI to an ever-older upstream contract. Any fork-specific
+CI changes must be re-curated explicitly after the upstream tree is installed.
+`pyproject.toml` is deliberately **not** in that list — its sole divergence from upstream adds `hermes_alerts` to
+`[tool.setuptools.packages.find]`, without which the alerting package is not
+installed and the Aeza alert timers break.
 
 Build the candidate on a temporary branch. The restore below changes only the
 index and worktree; the current commit remains the rollback point:
@@ -129,9 +174,11 @@ python -m hermes_update.snapshot_guard verify --bundle "$BUNDLE"
 ```
 
 Verification is fail-closed. It rejects unresolved collisions, a modified
-bundle, missing or extra overlay paths, content changes, mode changes, and
-unstaged edits. Only after `hermes_upstream_guard_OK` should you run the full
-test/build checks, replace `deploy/beget/upstream-base.txt` with the exact new
+bundle, missing or extra overlay paths, content changes, mode changes, unstaged
+edits, a policy that changed since the bundle was prepared, and a discarded path
+that does not actually hold upstream's version. Only after
+`hermes_upstream_guard_OK` should you run the full test/build checks,
+replace `deploy/beget/upstream-base.txt` with the exact new
 tag, commit the snapshot, create a pre-update backup ref, fast-forward `main`,
 push, and run `deploy/beget/deploy.sh`. Keep the generated bundle until the new
 container and the local backup jobs have both been verified.

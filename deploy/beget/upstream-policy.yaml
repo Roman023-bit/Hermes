@@ -1,0 +1,73 @@
+# Overlay policy for `hermes_update.snapshot_guard`.
+#
+# The guard blocks an upstream import whenever upstream and the local overlay
+# touch the same path. Without classification every release collides on the CI
+# workflows, and a guard that is always red stops being read. This file states,
+# per path, which side wins a collision.
+#
+#   upstream_wins  — the collision is expected. The local change on that path is
+#                    DISCARDED at import: it is excluded from the overlay patch,
+#                    listed in the report and recorded in the manifest.
+#   must_preserve  — the collision is fatal. The import stops until an operator
+#                    resolves the path by hand.
+#
+# Any colliding path not matched here is treated as unclassified and blocks the
+# import. Silence is never consent.
+#
+# Patterns match one path component per pattern component (`*` never crosses a
+# `/`), must start with a literal component and must contain at least one
+# literal component. `**` is rejected.
+
+version: 1
+
+rules:
+  - strategy: upstream_wins
+    reason: >-
+      The local workflow snapshot (28 files at v2026.8.3) is intentionally
+      disposable at release import. Re-applying it every time would silently
+      pin CI to an ever-older upstream contract, so the import keeps upstream's
+      workflows. Any fork-specific CI changes are re-curated explicitly after
+      the upstream tree is installed.
+    paths:
+      - ".github/workflows/*"
+
+  - strategy: must_preserve
+    reason: >-
+      pyproject.toml carries exactly one local change against upstream
+      v2026.8.3 — `hermes_alerts` and `hermes_alerts.*` added to
+      [tool.setuptools.packages.find] include. It is load-bearing: without it
+      the alerting package is not installed and the Aeza alert timers break.
+      No dependency, extra, entry-point or tool-setting divergence exists, so
+      the whole file stays hand-resolved rather than surrendered.
+    paths:
+      - "pyproject.toml"
+
+  - strategy: must_preserve
+    reason: >-
+      Deliberate patches inside upstream code. Losing one is a silent behaviour
+      regression, which is the exact failure this guard exists to prevent.
+    paths:
+      - "gateway/run.py"
+      - "agent/think_scrubber.py"
+      - "agent/agent_runtime_helpers.py"
+      - "tools/mcp_tool.py"
+      - "plugins/web/perplexity/*"
+      - ".gitignore"
+
+  - strategy: must_preserve
+    reason: >-
+      The regression tests that guard the patches above. Upstream edits these
+      files often, so they collide often — and surrendering one would drop the
+      coverage while leaving the patch it protects looking healthy.
+    paths:
+      - "tests/gateway/test_run_progress_topics.py"
+      - "tests/agent/test_think_scrubber.py"
+      - "tests/run_agent/test_run_agent.py"
+      - "tests/tools/test_mcp_tool.py"
+      - "tests/plugins/web/test_perplexity_usage.py"
+      - "tests/plugins/web/test_web_search_provider_plugins.py"
+
+# Deliberately left unclassified, so a collision stops the import and forces a
+# decision: the local-only runbooks (upstream has no such paths, so they cannot
+# collide), `contributors/emails/*`, and `sqlite_leak_fix.png`, which is a local
+# deletion of an upstream file — reinstating it must never happen by default.
