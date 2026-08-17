@@ -633,6 +633,19 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
+def _gateway_streaming_enabled(streaming_config: Any, platform_override: Any) -> bool:
+    """Apply the global streaming master switch before platform filtering.
+
+    Per-platform values select which platforms may stream after the global
+    switch is enabled.  They must never independently turn streaming on.
+    """
+    return bool(
+        getattr(streaming_config, "enabled", False)
+        and getattr(streaming_config, "transport", "auto") != "off"
+        and platform_override is not False
+    )
+
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -4370,11 +4383,7 @@ class TurnRunner:
             ctx.user_config, platform_key, "streaming"
         )
         # None = no per-platform override → follow global config
-        _streaming_enabled = (
-            _scfg.enabled and _scfg.transport != "off"
-            if _plat_streaming is None
-            else bool(_plat_streaming)
-        )
+        _streaming_enabled = _gateway_streaming_enabled(_scfg, _plat_streaming)
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
@@ -23678,11 +23687,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
         )
-        _streaming_enabled = (
-            _scfg.enabled and _scfg.transport != "off"
-            if _plat_streaming is None
-            else bool(_plat_streaming)
-        )
+        _streaming_enabled = _gateway_streaming_enabled(_scfg, _plat_streaming)
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 

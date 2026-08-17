@@ -980,6 +980,27 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
 
 
+@pytest.mark.asyncio
+async def test_platform_true_cannot_bypass_gateway_streaming_master_off(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-platform-streaming-master-off",
+        config_data={
+            "display": {
+                "platforms": {"telegram": {"streaming": True}},
+                "interim_assistant_messages": False,
+            },
+            "streaming": {"enabled": False},
+        },
+    )
+
+    assert result.get("already_sent") is not True
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
 class TransformedStreamAgent:
     """Streams a response, then signals the gateway that a plugin hook
     (``transform_llm_output``) modified the final text after streaming
